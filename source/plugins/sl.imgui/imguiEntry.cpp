@@ -20,6 +20,7 @@
 * SOFTWARE.
 */
 
+#include <array>
 #include <dxgi1_6.h>
 #include <d3d12.h>
 #include <future>
@@ -49,10 +50,11 @@
 #include "source/plugins/sl.imgui/imgui_impl_vulkan.h"
 #include "source/plugins/sl.imgui/imgui_impl_win32.h"
 #include "source/plugins/sl.imgui/DroidSans-Mono.h"
+#include "source/core/sl.extra/extra.h"
 
 using json = nlohmann::json;
 
-constexpr uint32_t NUM_BACK_BUFFERS = 4;
+constexpr uint32_t MAX_BACK_BUFFERS = 16;
 
 namespace sl
 {
@@ -103,25 +105,25 @@ struct IMGUIContext
     float uiSmallFontSize = DEFAULT_SMALL_FONT_SIZE;
     float uiMediumFontSize = DEFAULT_MEDIUM_FONT_SIZE;
 
-    std::array<void*, NUM_BACK_BUFFERS> backBuffers = {};
+    std::array<void*, MAX_BACK_BUFFERS> backBuffers = {};
     BOOL  dxgiFullscreenState{};
 
     ID3D12Device* device{};
     ID3D12DescriptorHeap* pd3dRtvDescHeap{};
     ID3D12DescriptorHeap* pd3dSrvDescHeap{};
-    D3D12_CPU_DESCRIPTOR_HANDLE  mainRenderTargetDescriptor[NUM_BACK_BUFFERS]{};
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, MAX_BACK_BUFFERS>  mainRenderTargetDescriptor{};
 
-    VkImageView                                vkImageViews[NUM_BACK_BUFFERS]{};
-    VkFramebuffer                              vkFrameBuffers[NUM_BACK_BUFFERS]{};
+    std::array<VkImageView, MAX_BACK_BUFFERS>    vkImageViews{};
+    std::array<VkFramebuffer, MAX_BACK_BUFFERS> vkFrameBuffers{};
     ImGui_ImplVulkan_InitInfo                  vkInfo{};
-    std::vector<std::pair<VkSurfaceKHR, HWND>> surfaceWindows{};
     VkSwapchainCreateInfoKHR                   vkSwapChainParams{};
     std::vector<VkImage> vkSwapchainImages{};
     HHOOK inputHook = nullptr;
 
     bool                      renderInternal         = true;   // true = render in this plugin, false = render in dlss_g
+    bool                      showDebugUI            = true;   // toggled by Ctrl+Shift+Home
     chi::ICommandListContext* cmdList                = nullptr;
-    chi::CommandQueue         cmdQueue               = nullptr;
+    chi::ChiCommandQueue*    cmdQueue               = nullptr;
     ID3D12Resource*           currentBackBuffer      = nullptr;
     VkImage                   currentBackBufferVk    = nullptr;
     uint32_t                  currentBackBufferIndex = 0;
@@ -304,16 +306,16 @@ Context* createContext(const ContextDesc& desc)
         {
             D3D12_DESCRIPTOR_HEAP_DESC desc = {};
             desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-            desc.NumDescriptors = NUM_BACK_BUFFERS;
+            desc.NumDescriptors = MAX_BACK_BUFFERS;
             desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
             desc.NodeMask = 1;
             if (d3d12Device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&ctx.pd3dRtvDescHeap)) != S_OK) return nullptr;
 
             SIZE_T rtvDescriptorSize = d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
             D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = ctx.pd3dRtvDescHeap->GetCPUDescriptorHandleForHeapStart();
-            for (UINT i = 0; i < NUM_BACK_BUFFERS; i++)
+            for (UINT i = 0; i < MAX_BACK_BUFFERS; i++)
             {
-                ctx.mainRenderTargetDescriptor[i] = rtvHandle;
+                ctx.mainRenderTargetDescriptor.at(i) = rtvHandle;
                 rtvHandle.ptr += rtvDescriptorSize;
             }
         }
@@ -327,7 +329,7 @@ Context* createContext(const ContextDesc& desc)
             if (d3d12Device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&ctx.pd3dSrvDescHeap)) != S_OK)  return nullptr;
         }
 
-        ImGui_ImplDX12_Init(d3d12Device, NUM_BACK_BUFFERS,
+        ImGui_ImplDX12_Init(d3d12Device, MAX_BACK_BUFFERS,
             (DXGI_FORMAT)desc.backBufferFormat, ctx.pd3dSrvDescHeap,
             ctx.pd3dSrvDescHeap->GetCPUDescriptorHandleForHeapStart(),
             ctx.pd3dSrvDescHeap->GetGPUDescriptorHandleForHeapStart());
@@ -346,8 +348,8 @@ Context* createContext(const ContextDesc& desc)
         info.Device = (VkDevice)device;
         info.PhysicalDevice = (VkPhysicalDevice)pdevice;
         info.Format = (VkFormat)desc.backBufferFormat;
-        info.ImageCount = NUM_BACK_BUFFERS;
-        info.MinImageCount = NUM_BACK_BUFFERS;
+        info.ImageCount = MAX_BACK_BUFFERS;
+        info.MinImageCount = MAX_BACK_BUFFERS;
 
         // Create the Render Pass
         VkRenderPass renderPass{};
@@ -405,12 +407,12 @@ void destroyContext(Context* ctx)
     {
         if (pluginCtx.vkInfo.Device != NULL)
         {
-            for (uint32_t i = 0; i < NUM_BACK_BUFFERS; i++)
+            for (uint32_t i = 0; i < MAX_BACK_BUFFERS; i++)
             {
-                vkDestroyFramebuffer(pluginCtx.vkInfo.Device, pluginCtx.vkFrameBuffers[i], nullptr);
-                pluginCtx.vkFrameBuffers[i] = VK_NULL_HANDLE;
-                vkDestroyImageView(pluginCtx.vkInfo.Device, pluginCtx.vkImageViews[i], nullptr);
-                pluginCtx.vkImageViews[i] = VK_NULL_HANDLE;
+                vkDestroyFramebuffer(pluginCtx.vkInfo.Device, pluginCtx.vkFrameBuffers.at(i), nullptr);
+                pluginCtx.vkFrameBuffers.at(i) = VK_NULL_HANDLE;
+                vkDestroyImageView(pluginCtx.vkInfo.Device, pluginCtx.vkImageViews.at(i), nullptr);
+                pluginCtx.vkImageViews.at(i) = VK_NULL_HANDLE;
             }
             vkDestroyRenderPass(pluginCtx.vkInfo.Device, (VkRenderPass)(g_ctx->apiData), NULL);
             g_ctx->apiData = VK_NULL_HANDLE;
@@ -432,12 +434,17 @@ void destroyContext(Context* ctx)
     ImGui::DestroyContext(g_ctx->imgui);
     ImPlot::DestroyContext(g_ctx->plot);
 
+    if (pluginCtx.cmdList != nullptr)
+    {
+        pluginCtx.cmdList->flushAll();
+        pluginCtx.compute->destroyCommandListContext(pluginCtx.cmdList);
+        pluginCtx.cmdList = nullptr;
+    }
+
     delete g_ctx;
     g_ctx = {};
 
-    pluginCtx.backBuffers[0] = {};
-    pluginCtx.backBuffers[1] = {};
-    pluginCtx.backBuffers[2] = {};
+    pluginCtx.backBuffers.fill({});
 
     pluginCtx.currentFrame = 0;
 }
@@ -497,15 +504,15 @@ void render(void* commandList, void* backBuffer, uint32_t index)
 
         //ImVec4 clearColor = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
-        if (ctx.backBuffers[index] != backBuffer)
+        if (ctx.backBuffers.at(index) != backBuffer)
         {
-            ctx.backBuffers[index] = backBuffer;
-            ctx.device->CreateRenderTargetView(resource, nullptr, ctx.mainRenderTargetDescriptor[index]);
+            ctx.backBuffers.at(index) = backBuffer;
+            ctx.device->CreateRenderTargetView(resource, nullptr, ctx.mainRenderTargetDescriptor.at(index));
         }
 
         cmdList->ResourceBarrier(1, &barrier);
-        //cmdList->ClearRenderTargetView(ctx.mainRenderTargetDescriptor[index], (float*)&clearColor, 0, NULL);
-        cmdList->OMSetRenderTargets(1, &ctx.mainRenderTargetDescriptor[index], FALSE, NULL);
+        //cmdList->ClearRenderTargetView(ctx.mainRenderTargetDescriptor.at(index), (float*)&clearColor, 0, NULL);
+        cmdList->OMSetRenderTargets(1, &ctx.mainRenderTargetDescriptor.at(index), FALSE, NULL);
         cmdList->SetDescriptorHeaps(1, &ctx.pd3dSrvDescHeap);
 
         ImGui::Render();
@@ -521,9 +528,9 @@ void render(void* commandList, void* backBuffer, uint32_t index)
         
         ImGuiIO& io = ImGui::GetIO();
 
-        if (ctx.backBuffers[index] != backBuffer)
+        if (ctx.backBuffers.at(index) != backBuffer)
         {
-            ctx.backBuffers[index] = backBuffer;
+            ctx.backBuffers.at(index) = backBuffer;
 
             // Create The Image Views
             {
@@ -538,8 +545,8 @@ void render(void* commandList, void* backBuffer, uint32_t index)
                 VkImageSubresourceRange image_range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
                 info.subresourceRange = image_range;
                 info.image = (VkImage)backBuffer;
-                assert(ctx.vkImageViews[index] == nullptr);
-                vkCreateImageView(ctx.vkInfo.Device, &info, nullptr, &ctx.vkImageViews[index]);
+                assert(ctx.vkImageViews.at(index) == nullptr);
+                vkCreateImageView(ctx.vkInfo.Device, &info, nullptr, &ctx.vkImageViews.at(index));
             }
 
             // Create Framebuffer
@@ -553,9 +560,9 @@ void render(void* commandList, void* backBuffer, uint32_t index)
                 info.width = (uint32_t)io.DisplaySize.x;
                 info.height = (uint32_t)io.DisplaySize.y;
                 info.layers = 1;
-                attachment[0] = ctx.vkImageViews[index];
-                assert(ctx.vkFrameBuffers[index] == nullptr);
-                vkCreateFramebuffer(ctx.vkInfo.Device, &info, nullptr, &ctx.vkFrameBuffers[index]);
+                attachment[0] = ctx.vkImageViews.at(index);
+                assert(ctx.vkFrameBuffers.at(index) == nullptr);
+                vkCreateFramebuffer(ctx.vkInfo.Device, &info, nullptr, &ctx.vkFrameBuffers.at(index));
             }
         }
 
@@ -566,7 +573,7 @@ void render(void* commandList, void* backBuffer, uint32_t index)
         VkRenderPassBeginInfo info = {};
         info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         info.renderPass = (VkRenderPass)g_ctx->apiData;
-        info.framebuffer = ctx.vkFrameBuffers[index];
+        info.framebuffer = ctx.vkFrameBuffers.at(index);
         info.renderArea.extent.width = (uint32_t)io.DisplaySize.x;
         info.renderArea.extent.height = (uint32_t)io.DisplaySize.y;
         info.clearValueCount = 0;
@@ -2334,7 +2341,7 @@ ImPlotPoint ImPlotPointGetterSlot2ForceZero(int idx, void* user_data)
 
 static void ImPlot_PlotLineG(const char* label_id, void* data, int count, int flags)
 {
-    SL_LOG_ERROR("sl.imgui unsupported function: ImPlot_PlotLineG");
+    SL_LOG_ERROR("%s unsupported function: ImPlot_PlotLineG", api::getPluginName());
     assert(0);
     return;
 }
@@ -2351,7 +2358,7 @@ static void ImPlot_SetNextFillStyle(const Float4& col, float alpha)
 
 static void ImPlot_PlotShadedG(const char* label_id, bool useGetterWithoutVal, void* data1, void* data2, int count, int flags)
 {       
-    SL_LOG_ERROR("sl.imgui unsupported function: ImPlot_PlotShadedG");
+    SL_LOG_ERROR("%s unsupported function: ImPlot_PlotShadedG", api::getPluginName());
     assert(0);
     return;
 }
@@ -3473,6 +3480,10 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     ctx.inputHook = SetWindowsHookEx(WH_GETMESSAGE, listener, GetModuleHandle(NULL), GetCurrentThreadId());
     SL_LOG_INFO("SetWindowsHookEx result - %s", std::system_category().message(GetLastError()).c_str());
 
+    // Keyboard bindings are process-global and have no unregister API; registerKey
+    // keeps the first "imguiToggleUI" binding and warns on duplicate reloads.
+    extra::keyboard::getInterface()->registerKey("imguiToggleUI", extra::keyboard::VirtKey(VK_HOME, true, true, false));
+
     using namespace sl::imgui;
 
     
@@ -3893,6 +3904,7 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     };
 
     parameters->set(param::imgui::kInterface, &ctx.ui);
+    parameters->set(param::imgui::kShowUI, ctx.showDebugUI);
 
     return true;
 }
@@ -3906,7 +3918,7 @@ void slOnPluginShutdown()
         imgui::destroyContext(nullptr);
         if (ctx.platform == RenderAPI::eVulkan)
         {
-            delete ctx.cmdQueue;
+            ctx.compute->destroyCommandQueue(ctx.cmdQueue);
         }
         ctx.cmdQueue = nullptr;
         ctx.vkSwapchainInfoMap.clear();
@@ -3938,32 +3950,37 @@ void updateEmbeddedJSON(json& config)
 
     json& extraConfig = *(json*)api::getContext()->extConfig;
 
+    extraConfig.contains("showDebugUI") ? extraConfig.at("showDebugUI").get_to(ctx.showDebugUI) : true;
     extraConfig.contains("smallFontSize") ? extraConfig.at("smallFontSize").get_to(ctx.uiSmallFontSize) : imgui::DEFAULT_SMALL_FONT_SIZE;
     extraConfig.contains("mediumFontSize") ? extraConfig.at("mediumFontSize").get_to(ctx.uiMediumFontSize) : imgui::DEFAULT_MEDIUM_FONT_SIZE;
 }
 
 void renderInternal()
 {
-    auto& ctx = (*sl::imgui::getContext());   
+    auto& ctx = (*sl::imgui::getContext());
     sl::imgui::setDisplaySize(Float2{ (float)ctx.backBufferWidth, (float)ctx.backBufferHeight });
     sl::imgui::newFrame((float)ctx.frameMeter.getMean());
     
     sl::imgui::pushFont(ctx.fonts.uiSmallFont);
 
-    // Auto adjust the side bar based on latest size
-    static Float2 s_lastSize{};
+    if (ctx.showDebugUI)
+    {
+        // Auto adjust the side bar based on latest size
+        static Float2 s_lastSize{};
 
-    sl::imgui::setNextWindowPos(imgui::Float2{ ctx.backBufferWidth - s_lastSize.x - 10, ctx.backBufferHeight * 0.5f - s_lastSize.y * 0.5f }, imgui::Condition::eAlways, imgui::Float2{ 0.0f, 0.0f });
-    sl::imgui::setNextWindowBgAlpha(0.5f);
+        sl::imgui::setNextWindowPos(imgui::Float2{ ctx.backBufferWidth - s_lastSize.x - 10, ctx.backBufferHeight * 0.5f - s_lastSize.y * 0.5f }, imgui::Condition::eAlways, imgui::Float2{ 0.0f, 0.0f });
+        sl::imgui::setNextWindowBgAlpha(0.5f);
 
-    sl::imgui::begin("Streamline", 0, imgui::kWindowFlagAlwaysAutoResize | imgui::kWindowFlagNoCollapse);
-    
-    // render all the other plugins UI via callbacks
-    sl::imgui::triggerRenderWindowCallbacks(false);
+        sl::imgui::begin("Streamline", 0, imgui::kWindowFlagAlwaysAutoResize | imgui::kWindowFlagNoCollapse);
+
+        // render all the other plugins UI via callbacks
+        sl::imgui::triggerRenderWindowCallbacks(false);
+
+        s_lastSize = sl::imgui::getWindowSize();
+        sl::imgui::end(); // Side bar
+    }
+
     sl::imgui::triggerRenderAnywhereCallbacks(false);
-
-    s_lastSize = sl::imgui::getWindowSize();
-    sl::imgui::end(); // Side bar    
     sl::imgui::popFont();
 
     //! Let rendering stabilize before trying to trigger UI rendering
@@ -3986,7 +4003,7 @@ void renderInternal()
         }
         else
         {
-            SL_LOG_ERROR("Unsupported render API used in sl.imgui plugin");
+            SL_LOG_ERROR("Unsupported render API used in %s plugin", api::getPluginName());
             assert(0);
         }
         
@@ -3998,14 +4015,24 @@ void renderInternal()
     }
 }
 
+static void processImguiKeybinds(imgui::IMGUIContext& ctx)
+{
+    if (extra::keyboard::getInterface()->wasKeyPressed("imguiToggleUI"))
+    {
+        ctx.showDebugUI = !ctx.showDebugUI;
+        api::getContext()->parameters->set(param::imgui::kShowUI, ctx.showDebugUI);
+        SL_LOG_INFO("ImGui UI %s (Ctrl+Shift+Home)", ctx.showDebugUI ? "shown" : "hidden");
+    }
+}
+
 // DXGI Hooks
 
 HRESULT slHookCreateSwapChainForCoreWindow(IDXGIFactory2* pFactory, IUnknown* pDevice, IUnknown* pWindow, const DXGI_SWAP_CHAIN_DESC1* pDesc, IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain)
 {
     auto& ctx = (*sl::imgui::getContext());
-    ctx.cmdQueue = (chi::CommandQueue)pDevice;
+    ctx.cmdQueue = (chi::ChiCommandQueue *)pDevice;
     ctx.bufferCount = pDesc->BufferCount;
-    ctx.compute->createCommandListContext(ctx.cmdQueue, ctx.bufferCount, ctx.cmdList, "imgui-cmdlist");
+    ctx.compute->createCommandListContext(ctx.cmdQueue, ctx.bufferCount, ctx.cmdList, SL_RESOURCE_NAME("cmdCtx.render").c_str());
     ctx.frameMeter.reset();
     return S_OK;
 }
@@ -4013,9 +4040,9 @@ HRESULT slHookCreateSwapChainForCoreWindow(IDXGIFactory2* pFactory, IUnknown* pD
 HRESULT slHookCreateSwapChainForHwnd(IDXGIFactory2* pFactory, IUnknown* pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1* pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc, IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain)
 {    
     auto& ctx = (*sl::imgui::getContext());
-    ctx.cmdQueue = (chi::CommandQueue)pDevice;    
+    ctx.cmdQueue = (chi::ChiCommandQueue *)pDevice;
     ctx.bufferCount = pDesc->BufferCount;    
-    ctx.compute->createCommandListContext(ctx.cmdQueue, ctx.bufferCount, ctx.cmdList, "imgui-cmdlist");    
+    ctx.compute->createCommandListContext(ctx.cmdQueue, ctx.bufferCount, ctx.cmdList, SL_RESOURCE_NAME("cmdCtx.render").c_str());    
     ctx.frameMeter.reset();    
     return S_OK;
 }
@@ -4023,9 +4050,9 @@ HRESULT slHookCreateSwapChainForHwnd(IDXGIFactory2* pFactory, IUnknown* pDevice,
 HRESULT slHookCreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain)
 {    
     auto& ctx = (*sl::imgui::getContext());
-    ctx.cmdQueue = (chi::CommandQueue)pDevice;
+    ctx.cmdQueue = (chi::ChiCommandQueue *)pDevice;
     ctx.bufferCount = pDesc->BufferCount;
-    ctx.compute->createCommandListContext(ctx.cmdQueue, ctx.bufferCount, ctx.cmdList, "imgui-cmdlist");
+    ctx.compute->createCommandListContext(ctx.cmdQueue, ctx.bufferCount, ctx.cmdList, SL_RESOURCE_NAME("cmdCtx.render").c_str());
     ctx.frameMeter.reset();
     return S_OK;
 }
@@ -4034,8 +4061,17 @@ HRESULT slHookPresent(IDXGISwapChain* swapChain, UINT SyncInterval, UINT Flags, 
 {    
     auto& ctx = (*sl::imgui::getContext());
 
+    processImguiKeybinds(ctx);
+
     if (ctx.renderInternal)
     {
+        // Recover cmdList if it was lost during a renderInternal transition
+        // (e.g. DLSS-G destroyed the proxy swap chain, returning control to sl.imgui)
+        if (ctx.cmdQueue && !ctx.cmdList)
+        {
+            SL_LOG_INFO("sl.imgui: cmdList was null, recreating command list context");
+            ctx.compute->createCommandListContext(ctx.cmdQueue, ctx.bufferCount, ctx.cmdList, SL_RESOURCE_NAME("cmdCtx.render").c_str());
+        }
         if (ctx.cmdQueue && ctx.cmdList)
         {
             ctx.frameMeter.timestamp();
@@ -4108,27 +4144,14 @@ VkResult slHookVkCreateSwapchainKHR(VkDevice Device, const VkSwapchainCreateInfo
         ctx.backBufferHeight  = ctx.vkSwapChainParams.imageExtent.height;
         ctx.bufferCount       = ctx.vkSwapChainParams.minImageCount;
 
-        // Find & cache the HWND
-        const auto surfaceIt = std::find_if(ctx.surfaceWindows.begin(), ctx.surfaceWindows.end(), [CreateInfo](const auto& it) { return it.first == CreateInfo->surface; });
-        if (surfaceIt != ctx.surfaceWindows.end())
+        // Look up the HWND from the interposer's surface-to-HWND map
+        // (populated when vkCreateWin32SurfaceKHR was called)
+        ctx.backBufferHwnd = NULL;
+        PFunGetSurfaceWindow* getSurfaceWindow{};
+        param::getPointerParam(api::getContext()->parameters, param::interposer::kPFunGetSurfaceWindow, &getSurfaceWindow);
+        if (getSurfaceWindow)
         {
-            ctx.backBufferHwnd = surfaceIt->second;
-        }
-        else
-        {
-            // Find first window associated with our process (there is no way to get HWND from VK swap-chain)
-            HWND hCurWnd = NULL;
-            do
-            {
-                hCurWnd = FindWindowEx(NULL, hCurWnd, NULL, NULL);
-                DWORD dwProcID = 0;
-                GetWindowThreadProcessId(hCurWnd, &dwProcID);
-                if (dwProcID == GetCurrentProcessId())
-                {
-                    ctx.backBufferHwnd = hCurWnd;
-                    break;
-                }
-            } while (hCurWnd != NULL);
+            ctx.backBufferHwnd = getSurfaceWindow(CreateInfo->surface);
         }
     }
 
@@ -4177,19 +4200,6 @@ void slHookVkDestroySwapchainKHR(VkDevice Device, VkSwapchainKHR Swapchain, cons
     }
 }
 
-VkResult slHookVkCreateWin32SurfaceKHR(VkInstance Instance, const VkWin32SurfaceCreateInfoKHR* CreateInfo, const VkAllocationCallbacks* Allocator, VkSurfaceKHR* Surface)
-{
-    auto& ctx = (*sl::imgui::getContext());
-    ctx.surfaceWindows.emplace_back(*Surface, CreateInfo->hwnd);
-    return VK_SUCCESS;
-}
-
-void slHookVkDestroySurfaceKHR(VkInstance Instance, VkSurfaceKHR Surface, const VkAllocationCallbacks* Allocator, bool& skip)
-{
-    auto& ctx = (*sl::imgui::getContext());
-    ctx.surfaceWindows.erase(std::remove_if(ctx.surfaceWindows.begin(), ctx.surfaceWindows.end(), [Surface](const auto& it) { return it.first == Surface; }), ctx.surfaceWindows.end());
-}
-
 VkResult slHookVkGetSwapchainImagesKHR(VkDevice Device, VkSwapchainKHR Swapchain, uint32_t* SwapchainImageCount, VkImage* SwapchainImages, bool& Skip)
 {
     auto& ctx = (*sl::imgui::getContext());
@@ -4211,6 +4221,8 @@ VkResult slHookVkGetSwapchainImagesKHR(VkDevice Device, VkSwapchainKHR Swapchain
 VkResult slHookVkPresent(VkQueue Queue, const VkPresentInfoKHR* PresentInfo, bool& Skip)
 {
     auto& ctx = (*sl::imgui::getContext());
+
+    processImguiKeybinds(ctx);
 
     if (ctx.renderInternal)
     {
@@ -4248,7 +4260,7 @@ VkResult slHookVkPresent(VkQueue Queue, const VkPresentInfoKHR* PresentInfo, boo
             assert((qInfo.flags & VK_QUEUE_GRAPHICS_BIT) != 0);
             if (ctx.cmdQueue == nullptr)
             {
-                ctx.cmdQueue = new chi::CommandQueueVk(Queue, chi::CommandQueueType::eGraphics, qInfo.familyIndex, qInfo.index);
+                ctx.cmdQueue = (chi::ChiCommandQueue *)new chi::CommandQueueVk(Queue, chi::CommandQueueType::eGraphics, qInfo.familyIndex, qInfo.index);
             }
             else
             {
@@ -4263,7 +4275,7 @@ VkResult slHookVkPresent(VkQueue Queue, const VkPresentInfoKHR* PresentInfo, boo
             {
                 ctx.compute->destroyCommandListContext(ctx.cmdList);
             }
-            chi::ComputeStatus ret = ctx.compute->createCommandListContext(ctx.cmdQueue, ctx.bufferCount, ctx.cmdList, "imgui-cmdlist");
+            chi::ComputeStatus ret = ctx.compute->createCommandListContext(ctx.cmdQueue, ctx.bufferCount, ctx.cmdList, SL_RESOURCE_NAME("cmdCtx.render").c_str());
             if (ret != chi::ComputeStatus::eOk)
             {
                 return VK_ERROR_INITIALIZATION_FAILED;
@@ -4312,8 +4324,6 @@ SL_EXPORT void* slGetPluginFunction(const char* functionName)
     SL_EXPORT_FUNCTION(slHookVkCreateSwapchainKHR);
     SL_EXPORT_FUNCTION(slHookVkCreateSwapchainKHRPost);
     SL_EXPORT_FUNCTION(slHookVkDestroySwapchainKHR);
-    SL_EXPORT_FUNCTION(slHookVkCreateWin32SurfaceKHR);
-    SL_EXPORT_FUNCTION(slHookVkDestroySurfaceKHR);
     SL_EXPORT_FUNCTION(slHookVkGetSwapchainImagesKHR);
     SL_EXPORT_FUNCTION(slHookVkPresent);
 

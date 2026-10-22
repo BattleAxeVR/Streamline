@@ -22,14 +22,13 @@
 
 #pragma once
 
-#if SL_WINDOWS
 #include <windows.h>
-#endif
 #include <string>
 #include <vector>
 #include <functional>
 #include <mutex>
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <sstream>
 #include <atomic>
@@ -38,21 +37,14 @@
 #include <locale>
 #include <iomanip>
 #include <array>
+#include <chrono>
 
-#ifdef SL_WINDOWS
 #define SL_IGNOREWARNING_PUSH __pragma(warning(push))
 #define SL_IGNOREWARNING_POP __pragma(warning(pop))
 #define SL_IGNOREWARNING(w) __pragma(warning(disable : w))
 #define SL_IGNOREWARNING_WITH_PUSH(w)                    \
         SL_IGNOREWARNING_PUSH                            \
         SL_IGNOREWARNING(w)
-#else
-#define SL_IGNOREWARNING_PUSH _Pragma("GCC diagnostic push")
-#define SL_IGNOREWARNING_POP _Pragma("GCC diagnostic pop")
-#define SL_INTERNAL_IGNOREWARNING(str) _Pragma(#str)
-#define SL_IGNOREWARNING(w) SL_INTERNAL_IGNOREWARNING(GCC diagnostic ignored #w)
-#define SL_IGNOREWARNING_WITH_PUSH(w) SL_IGNOREWARNING_PUSH SL_IGNOREWARNING(w)
-#endif
 
 
 namespace sl
@@ -98,6 +90,14 @@ inline std::string toStr(const wchar_t* s)
     return utf16ToUtf8(s);
 }
 
+inline std::string toUpper(const std::string& s)
+{
+    std::string result = s;
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return result;
+}
+
 template <typename I>
 std::string toHexStr(I w, size_t hex_len = sizeof(I) << 1)
 {
@@ -122,7 +122,6 @@ inline constexpr uint32_t align(uint32_t size, uint32_t alignment)
 
 inline bool getEnvVar(const char* varName, std::string& value)
 {
-#if SL_WINDOWS
     auto neededSize = GetEnvironmentVariableA(varName, nullptr, 0);
     if (!neededSize)
     {
@@ -131,37 +130,14 @@ inline bool getEnvVar(const char* varName, std::string& value)
     value.resize(neededSize);
     neededSize = GetEnvironmentVariableA(varName, value.data(), neededSize);
     return true;
-#else
-    auto result = std::getenv(varName);
-    if (!result)
-    {
-        return false;
-    }
-    value = result;
-    return true;
-#endif
 }
 
 //! If value is null it will remove the environment variable
 inline bool setEnvVar(const char* varName, const char* value)
 {
-    bool result;
-#if SL_WINDOWS
-    result = (SetEnvironmentVariableA(varName, value) != 0);
-#else
-    if (value)
-    {
-        result = (setenv(varName, value, /*overwrite=*/1) == 0);
-    }
-    else
-    {
-        result = (unsetenv(varName) == 0);
-    }
-#endif
-    return result;
+    return (SetEnvironmentVariableA(varName, value) != 0);
 }
 
-#if SL_WINDOWS
 inline bool getRegistryDword(const WCHAR *InRegKeyHive, const WCHAR *InRegKeyName, DWORD *OutValue)
 {
     HKEY Key;
@@ -195,7 +171,6 @@ inline bool getRegistryString(const WCHAR *InRegKeyHive, const WCHAR *InRegKeyNa
     }
     return false;
 };
-#endif
 
 // Returns a microseconds string as seconds:mseconds:useconds
 inline std::string prettifyMicrosecondsString(const uint64_t microseconds)
@@ -301,9 +276,7 @@ struct TAverageValueMeter
 {
     TAverageValueMeter()
     {
-#ifdef SL_WINDOWS
         QueryPerformanceFrequency(&frequency);
-#endif
     };
 
     TAverageValueMeter(const TAverageValueMeter& rhs) { operator=(rhs); }
@@ -314,11 +287,9 @@ struct TAverageValueMeter
         val = rhs.val.load();
         sum = rhs.sum;
         window = rhs.window;
-#ifdef SL_WINDOWS
         frequency = rhs.frequency;
         startTime = rhs.startTime;
         elapsedUs = rhs.elapsedUs;
-#endif
         return *this;
     }
 
@@ -330,24 +301,19 @@ struct TAverageValueMeter
         sum = 0;
         mean = 0;
         std::fill(window.begin(), window.end(), 0);
-#ifdef SL_WINDOWS
         startTime = {};
         elapsedUs = {};
-#endif
     }
 
     //! NOT thread safe
     void begin()
     {
-#ifdef SL_WINDOWS
         QueryPerformanceCounter(&startTime);
-#endif
     }
 
     //! NOT thread safe
     void end()
     {
-#ifdef SL_WINDOWS
         if (startTime.QuadPart > 0)
         {
             LARGE_INTEGER endTime{};
@@ -358,7 +324,6 @@ struct TAverageValueMeter
             auto elapsedMs = elapsedUs.QuadPart / 1000.0;
             add(elapsedMs);
         }
-#endif
     }
 
     //! NOT thread safe
@@ -371,7 +336,6 @@ struct TAverageValueMeter
     //! NOT thread safe
     int64_t timeFromLastTimestampUs()
     {
-#ifdef SL_WINDOWS
         if (startTime.QuadPart > 0)
         {
             LARGE_INTEGER endTime{};
@@ -381,9 +345,6 @@ struct TAverageValueMeter
             elapsedUs.QuadPart /= frequency.QuadPart;
         }
         return elapsedUs.QuadPart;
-#else
-        return 0;
-#endif
     }
 
     //! Performance sensitive code, can be called
@@ -422,11 +383,7 @@ struct TAverageValueMeter
     //! NOT thread safe
     inline int64_t getElapsedTimeUs() const
     {
-#ifdef SL_WINDOWS
         return elapsedUs.QuadPart;
-#else
-        return 0;
-#endif
     }
 
     //! Thread safe
@@ -443,11 +400,9 @@ private:
     double sum{};
     std::array<double, WINDOW_SIZE> window;
 
-#ifdef SL_WINDOWS
     LARGE_INTEGER frequency{};
     LARGE_INTEGER startTime{};
     LARGE_INTEGER elapsedUs{};
-#endif
 };
 typedef TAverageValueMeter<kAverageMeterWindowSize> AverageValueMeter;
 

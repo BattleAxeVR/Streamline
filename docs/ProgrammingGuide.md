@@ -2,7 +2,7 @@
 Streamline - SL
 =======================
 
-Version 2.7.2
+Version 2.14.16
 =======
 
 1 SETTING UP
@@ -133,7 +133,7 @@ Here is the typical lifecycle for SL features:
 * After device creation, any calls to SL will succeed only if the feature is FULLY functional on that device
   * This means that the set of features that return true from `slIsFeatureSupported` AFTER device creation can be smaller (but not larger) than the set that returned true from `slIsFeatureSupported` after slInit, but before device creation
   * And thus, at this point, any SL method can be used safely since all required and supported features are initialized
-  * In addition, at this point it is possible to [explicitly allocate/free resources used by feature(s)](#27-explicit-resource-allocation-and-de-allocation)
+  * In addition, at this point it is possible to [explicitly allocate/free resources used by feature(s)](#28-explicit-resource-allocation-and-de-allocation)
 
 > **IMPORTANT:**
 > `slInit` must NOT be called within DLLMain entry point in your application because that can cause a deadlock.
@@ -372,6 +372,19 @@ using PFun_ResourceReleaseCallback = void(Resource* resource, void* device);
 > **NOTE:**
 > Memory management done by the host is an optional feature and it is NOT required for the SL to work properly. If used, proper care needs to be taken to avoid releasing resources which are still used by the GPU.
 
+> **IMPORTANT:**
+> Streamline defers destruction of internal GPU resources by a few frames for safety. These resources are actually released when Streamline performs garbage collection each frame.
+>
+> - In the default integration path, Streamline’s common plugin calls `presentCommon()` once per frame (and also collects from internal pools). If `presentCommon()` is not invoked, garbage collection will not run and memory can grow across events such as swapchain resize.
+> - If you use manual hooking or otherwise bypass the default interposer, you must ensure the common plugin’s `presentCommon()` function is called every frame. This is required for internal bookkeeping and garbage collection.
+> - Debug tip: set a breakpoint in the common plugin’s `presentCommon()` function. Verify it is hit each frame during normal rendering and around swapchain resize.
+
+> **If `presentCommon()` is not called:**
+> - Ensure Streamline is initialized early in process startup and not disabled by configuration.
+> - If you are using manual hooking or a custom integration, wire your frame presentation path so that Streamline’s common plugin executes `presentCommon()` exactly once per rendered frame (typically at the end of the frame). The recommended way is to upgrade your frame presentation interface using `slUpgradeInterface` immediately after creation (e.g., the swapchain on DirectX), as described in the Manual Hooking guide, so Streamline can invoke `presentCommon()`.
+> - If your engine has multiple presentation paths (e.g., different backends or windowing modes), make sure all active paths invoke `presentCommon()`.
+> - After changes, re-run with a breakpoint in `presentCommon()` to confirm it executes every frame and around window resizes.
+
 #### 2.2.3 INITIALIZATION
 
 To initialize an SDK instance, simply call the following method:
@@ -598,7 +611,8 @@ SL_API bool slSetVulkanInfo(const sl::VulkanInfo& info);
 ```
 
 > NOTE:
-> For more details regarding the `slSetVulkanInfo` please see [manual hooking programming guide](./ProgrammingGuideManualHooking.md)
+> 1. For more details regarding the `slSetVulkanInfo` please see [manual hooking programming guide](./ProgrammingGuideManualHooking.md)
+> 2. If the host application intends to view names of SL and NGX feature resources (e.g. DLSS textures and buffers) and SL and NGX profiling markers in tools such as Nsight, enable the `VK_EXT_debug_utils` instance extension when creating its `VkInstance`.
 
 ### 2.6 HOW TO CHECK FEATURE'S VERSION
 
@@ -736,7 +750,11 @@ For example, let's assume we have two viewports using `sl::kFeatureDLSS` and we 
 
 ### 2.9 TAGGING RESOURCES
 
-The appropriate D3D11/D3D12/VK resources should be tagged globally using the `slSetTag` or locally with the `slEvaluateFeature` API and the corresponding `BufferType` unique id.  Note that the list below may not accurately represent the full set of optional and even required items in a given version's header.  The Programming Guide for each individual plugin/feature will discuss which of these tags are required and/or used by that feature.
+API 'slSetTag' is deprecated and is no longer recommended to be used. A new API `slSetTagForFrame` has been introduced passing in frame-token to tag resources for a specific frame, i.e. associated with a frame index facilitating tagging for multiple frames in flight on CPU at the same time. This deprecates the API 'slSetTag' and cannot be used with the new API `slSetTagForFrame`. sl::PreferenceFlags flag `eUseFrameBasedResourceTagging` must be set to enforce frame-based resource tagging using SL APIs `slSetTagForFrame` and `slEvaluateFeature`.
+
+The appropriate D3D11/D3D12/VK resources should be tagged globally using the `slSetTagForFrame` or locally with the `slEvaluateFeature` API and the corresponding `BufferType` unique id.  Note that the list below may not accurately represent the full set of optional and even required items in a given version's header.  The Programming Guide for each individual plugin/feature will discuss which of these tags are required and/or used by that feature.
+
+Note that using that same command list during resource-tagging for multiple frames at the same time is at developer's discretion but correctness of operations can't be guaranteed, even if D3D12 supports cocnurrent CL recording and submission.
 
 ```cpp
 //! Buffer types used for tagging
@@ -832,6 +850,25 @@ enum ResourceLifecycle
     eValidUntilEvaluate
 };
 
+//! NOTE: sl::PreferenceFlags::eUseFrameBasedResourceTagging must be set when using this API.
+//! Tags resource globally
+//!
+//! Call this method to tag the appropriate buffers in global scope.
+//!
+//! @param frame Specifies the frame this tag applies to. Frame token can be obtained using slGetNewFrameToken API.
+//! @param viewport Specifies viewport this tag applies to
+//! @param tags Pointer to resources tags, set to null to remove the specified tag
+//! @param numTags Number of resource tags in the provided list
+//! @param cmdBuffer Command buffer to use (optional and can be null if ALL tags are null or have eValidUntilPresent life-cycle)
+//! @return sl::ResultCode::eOk if successful, error code otherwise (see sl_result.h for details)
+//!
+//! IMPORTANT: GPU payload that generates content for the provided tag(s) MUST be either already submitted to the provided command buffer 
+//! or some other command buffer which is guaranteed, by the host application, to be executed BEFORE the provided command buffer.
+//! 
+//! This method is thread safe and requires DX/VK device to be created before calling it.
+SL_API sl::Result slSetTagForFrame(const sl::FrameToken& frame, const sl::ViewportHandle& viewport, const sl::ResourceTag* resources, uint32_t numResources, sl::CommandBuffer* cmdBuffer);
+
+//! NOTE: Following API has now been DEPRECATED in favor of the new slSetTagForFrame API above.
 //! Tags resource globally
 //!
 //! Call this method to tag the appropriate buffers in global scope.
@@ -852,10 +889,19 @@ SL_API sl::Result slSetTag(const sl::ViewportHandle& viewport, const sl::Resourc
 > **IMPORTANT:**
 > GPU payload that generates content for any tagged resource MUST be either already submitted to the provided command list or some other command list which is guaranteed to be executed BEFORE.
 
-Please note that **correct resource state MUST be provided by the host** for all tagged resources. For the volatile resources this would be their state on the command list which is passed to `slSetTag` and for the immutable resources it should be the state when resource is used by SL. 
+Please note that **correct resource state MUST be provided by the host** for all tagged resources. For the volatile resources this would be their state on the command list which is passed to `slSetTagForFrame` and for the immutable resources it should be the state when resource is used by SL. 
 If state of an immutable resource can change from use case to use case then resource should be tagged multiple times or passed as input to `slEvaluateFeature` with the appropriate state. Here is an example:
 
 ```cpp
+
+sl::Preferences pref{};
+// Inform SL that it is doing frame-based resource tagging.
+pref.flags |= PreferenceFlag::eUseFrameBasedResourceTagging;
+// Set other preferences, request features etc.
+if(SL_FAILED(result, slInit(pref)))
+{
+    // Handle error, check the logs
+}
 
 // IMPORTANT: If using d3d11 set all resource states to 0
 if(d3d11)
@@ -871,9 +917,15 @@ sl::Resource mvec = sl::Resource{ sl::ResourceType::eTex2d, myNativeObject, null
 sl::ResourceTag depthTag = sl::ResourceTag {&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &fullExtent };
 sl::ResourceTag mvecTag = sl::ResourceTag {&mvec, sl::kBufferTypeMvec, sl::ResourceLifecycle::eValidUntilPresent, &fullExtent };
 
+sl::FrameToken* currentFrame{};
+if(SL_FAILED(result, slGetNewFrameToken(currentFrame)))
+{
+    // Handle error, check the logs
+}
+
 // Tag as a group for simplicity
 sl::ResourceTag inputs[] = {depthTag, mvecTag};
-if(SL_FAILED(result, slSetTag(viewport, inputs, _countof(inputs), cmdList)))
+if(SL_FAILED(result, slSetTagForFrame(*currentFrame, viewport, inputs, _countof(inputs), cmdList)))
 {
    // Handle error, check the logs
 }
@@ -883,7 +935,7 @@ if(SL_FAILED(result, slSetTag(viewport, inputs, _countof(inputs), cmdList)))
 * When using d3d11 please make sure to use state 0 (D3D12_RESOURCE_STATE_COMMON) for all tags.
 * When using Vulkan, ensure to specify aspect mask of the image view member of depth buffer `sl::Resource`, containing both depth and stencil bits in its format, to be of type depth only, during its tagging. This is because SL features use depth data from depth-stencil buffer and as per [VUID-VkDescriptorImageInfo-imageView-01976](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkDescriptorImageInfo.html#VUID-VkDescriptorImageInfo-imageView-01976), if the Vulkan image view is being used for texturing, then its aspect mask can either be of type depth or stencil but not both.
 
-Instead of using global scope and `slSetTag`, resources can also be tagged in local scope by passing them in directly when calling `slEvaluateFeature` if that is more convenient, here is an example:
+Instead of using global scope and `slSetTagForFrame`, resources can also be tagged in local scope by passing them in directly when calling `slEvaluateFeature` if that is more convenient, here is an example:
 
 ```cpp
 // Make sure DLSS is available and user selected this option in the UI
@@ -917,12 +969,12 @@ If resource is tagged as `sl::ResourceLifecycle::eOnlyValidNow` SL will **make a
 ```cpp
 //! IMPORTANT: Tagging as volatile, resource can be reused, changed or even deleted after it is tagged. 
 //!
-//! Passing state which is valid on the command list we are using with slSetTag
+//! Passing state which is valid on the command list we are using with slSetTagForFrame
 
 sl::Resource depth = sl::Resource{ sl::ResourceType::eTex2d, myNativeDepth, nullptr, nullptr, depthStateOnCmdList};
 sl::ResourceTag depthTag = sl::ResourceTag {&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &depthExtent };
 // SL will make a copy but ONLY if DLSS-G or any other feature is active and needs this tag later on
-if(SL_FAILED(result, slSetTag(viewport, &depthTag, 1, cmdList)))
+if(SL_FAILED(result, slSetTagForFrame(*currentFrame, viewport, &depthTag, 1, cmdList)))
 {
     // Handle error, check the logs
 }
@@ -956,7 +1008,7 @@ else
 // Now we tag depth GLOBALLY with state which is valid when frame present is called
 sl::Resource depth = sl::Resource{ sl::ResourceType::eTex2d, myNativeObject, nullptr, nullptr, depthStateOnPresent};
 sl::ResourceTag depthTag = sl::ResourceTag {&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &depthExtent };
-if(SL_FAILED(result, slSetTag(viewport, &depthTag, 1, myCmdList)))
+if(SL_FAILED(result, slSetTagForFrame(*currentFrame, viewport, &depthTag, 1, myCmdList)))
 {
     // Handle error, check the logs
 }
@@ -968,7 +1020,7 @@ When resource tag of type `sl::ResourceLifecycle::eValidUntilPresent` is no long
 // Set resource to null to release references
 sl::ResourceTag depthTag = sl::ResourceTag {nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent};
 // No need for command list when tags are null
-slSetTag(viewport, &depthTag, 1);
+slSetTagForFrame(*currentFrame, viewport, &depthTag, 1);
 ```
 
 > **NOTE:**
@@ -1237,6 +1289,8 @@ myViewport->setSize(dlssSettings.renderWidth, dlssSettings.renderHeight);
 By design, SL SDK enables `host assisted replacement or injection of specific rendering features`. In order for SL features to work, specific sections in the rendering pipeline need to be marked with the following method:
 
 ```cpp
+//! NOTE: sl::PreferenceFlags::eUseFrameBasedResourceTagging must be set when using this API to do
+//! frame-based resource tagging for multiple frames in flight at the same time.
 //! Evaluates feature
 //! 
 //! Use this method to mark the section in your rendering pipeline
@@ -1501,4 +1555,3 @@ If an exception is thrown while executing SL code mini-dump will be written to `
 ------------------------------------------------
 
 For any SL related questions, please email StreamlineSupport@nvidia.com.
-

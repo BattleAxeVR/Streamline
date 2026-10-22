@@ -20,15 +20,10 @@
 * SOFTWARE.
 */
 
-#ifdef SL_WINDOWS
 #include <Windows.h>
 #include <versionhelpers.h>
-#else
-#include <dlfcn.h>
-#include <dirent.h>
-#include <unistd.h>
-#endif
 
+#include <set>
 #include <sstream>
 #include <random>
 
@@ -37,8 +32,8 @@
 #include "source/core/sl.api/internal.h"
 #include "source/core/sl.log/log.h"
 #include "source/core/sl.file/file.h"
+#include "source/core/sl.ota/iota.h"
 #include "source/core/sl.param/parameters.h"
-#include "source/core/sl.plugin-manager/ota.h"
 #include "source/core/sl.plugin-manager/pluginManager.h"
 #include "source/core/sl.security/secureLoadLibrary.h"
 #include "source/core/sl.interposer/versions.h"
@@ -46,7 +41,6 @@
 #include "source/plugins/sl.imgui/imgui.h"
 #include "_artifacts/gitVersion.h"
 #include "include/sl_helpers.h"
-
 
 namespace sl
 {
@@ -82,6 +76,10 @@ public:
     virtual const HookList& getBeforeHooksWithoutLazyInit(FunctionHookID functionHookID) override final;
     virtual const HookList& getAfterHooksWithoutLazyInit(FunctionHookID functionHookID) override final;
 
+    virtual void setSurfaceWindow(VkSurfaceKHR surface, HWND hwnd) override final;
+    virtual void removeSurfaceWindow(VkSurfaceKHR surface) override final;
+    virtual HWND getSurfaceWindow(VkSurfaceKHR surface) const override final;
+
     virtual Result setHostSDKVersion(uint64_t sdkVersion) override final;
 
     virtual const Version& getHostSDKVersion() override final
@@ -105,6 +103,7 @@ public:
         
         // Allow override for features to load
 #ifndef SL_PRODUCTION
+#if !defined(SL_UNITTEST_ONLY_CODE)
         auto interposerConfig = sl::interposer::getInterface()->getConfig();
 
         //! NOTE: There is no need build a list of available plugins, we don't want unnecessary dependencies
@@ -131,6 +130,7 @@ public:
                 SL_LOG_ERROR( "Failed to parse JSON file - %s", e.what());
             }
         }
+#endif
 #endif
 
         // This could be already populated from JSON config in development builds
@@ -226,6 +226,35 @@ public:
         return false;
     }
 
+    Result getFeatureSupportedExternalConfig(Feature feature) final
+    {
+        auto it = m_featureSupportedMap.find(feature);
+        if (it == m_featureSupportedMap.end())
+        {
+            std::string jsonConfig{};
+            if (!plugin_manager::getInterface()->getExternalFeatureConfig(feature, jsonConfig))
+            {
+                m_featureSupportedMap[feature] = Result::eErrorFeatureMissing;
+                SL_LOG_ERROR("'%s' is missing.", getFeatureAsStr(feature));
+                return Result::eErrorFeatureMissing;
+            }
+
+            // Any JSON parser can be used here
+            std::istringstream stream(jsonConfig);
+            nlohmann::json extCfg;
+            stream >> extCfg;
+            if (extCfg.contains("/feature/supported"_json_pointer) && !extCfg["feature"]["supported"])
+            {
+                SL_LOG_ERROR("'%s' is not supported.", getFeatureAsStr(feature));
+                m_featureSupportedMap[feature] = Result::eErrorFeatureNotSupported;
+                return Result::eErrorFeatureNotSupported;
+            }
+            m_featureSupportedMap[feature] = Result::eOk;
+        }
+
+        return m_featureSupportedMap[feature];
+    }
+
     virtual bool getLoadedFeatureConfigs(std::vector<json>& configList) const override final
     {
         for (auto plugin : m_plugins)
@@ -244,6 +273,19 @@ public:
         return !featureList.empty();
     }
 
+    virtual bool getLoadedFeatureVersion(Feature feature, sl::Version& version) const override final
+    {
+        for (auto plugin : m_plugins)
+        {
+            if (plugin->id == feature)
+            {
+                version = plugin->version;
+                return true;
+            }
+        }
+        return false;
+    }
+
     void populateLoaderJSON(uint32_t deviceType, json& config);
 
     std::mutex m_mtxPluginConfig;
@@ -254,6 +296,7 @@ private:
 
     Result mapPlugins(std::vector<fs::path>& files);
     Result findPlugins(const fs::path& path, std::vector<fs::path>& files);
+    bool findAllOTAPlugins(std::vector<fs::path>& outList, bool loadOptionalUpdates, bool useOverride);
     
 
     struct Plugin
@@ -266,6 +309,7 @@ private:
         HMODULE lib{};
         std::string name{};
         std::string sha{};
+        std::string buildConfig{};
 
         fs::path filename{};
         fs::path fullpath{};
@@ -317,9 +361,11 @@ private:
 
     using PluginMap = std::map<Feature,Plugin*>;
     using ConfigMap = std::map<Feature, json>;
+    using FeatureSupportedMap = std::map<Feature, Result>;
 
     PluginMap m_featurePluginsMap;
     ConfigMap m_featureExternalConfigMap;
+    FeatureSupportedMap m_featureSupportedMap;
 
     int m_appId = 0;
     inline static PluginManagerStatus s_status = PluginManagerStatus::eUnknown;
@@ -338,6 +384,11 @@ private:
     Preferences m_pref{};
 
     sl::ota::IOTA* m_ota{};
+
+    std::set<std::wstring> m_otaOverridePaths;
+
+    //! Surface-to-HWND mapping for Vulkan, populated before device/plugin init
+    std::vector<std::pair<VkSurfaceKHR, HWND>> m_surfaceWindows{};
 };
 
 IPluginManager* getInterface()
@@ -351,8 +402,11 @@ IPluginManager* getInterface()
 
 void destroyInterface()
 {
-    delete PluginManager::s_manager;
-    PluginManager::s_manager = {};
+    if (PluginManager::s_manager)
+    {
+        delete PluginManager::s_manager;
+        PluginManager::s_manager = {};
+    }
 }
 
 Result PluginManager::setHostSDKVersion(uint64_t sdkVersion)
@@ -486,11 +540,7 @@ Result PluginManager::setFeatureEnabled(Feature feature, bool value)
 
 Result PluginManager::findPlugins(const fs::path& directory, std::vector<fs::path>& files)
 {
-#ifdef SL_WINDOWS
     std::wstring dynamicLibraryExt = L".dll";
-#else
-    std::wstring dynamicLibraryExt = L".so";
-#endif
 
     SL_LOG_INFO("Looking for plugins in %S ...", directory.c_str());
     try
@@ -521,6 +571,33 @@ Result PluginManager::findPlugins(const fs::path& directory, std::vector<fs::pat
         SL_LOG_ERROR( "Failed while looking for plugins - error %s", e.what());
     }
     return files.empty() ? Result::eErrorNoPlugins : Result::eOk;
+}
+
+bool PluginManager::findAllOTAPlugins(std::vector<fs::path>& outList, bool loadOptionalUpdates, bool useOverride)
+{
+    for (Feature f : m_featuresToLoad)
+    {
+        fs::path pluginPath;
+        if (m_ota->getOTAPluginForFeature(f, m_api, pluginPath, loadOptionalUpdates, useOverride))
+        {
+            SL_LOG_INFO("Found %sOTA plugin: %ls", useOverride ? "override " : "", pluginPath.c_str());
+            if (f == kFeatureCommon)
+            {
+                // Push kFeatureCommon OTA to front of list so sl.common is
+                // loaded first+foremost.
+                outList.insert(outList.begin(), pluginPath);
+            }
+            else
+            {
+                outList.push_back(pluginPath);
+            }
+        }
+        else
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool PluginManager::loadPlugin(const fs::path pluginFullPath, Plugin **ppPlugin)
@@ -598,11 +675,21 @@ bool PluginManager::loadPlugin(const fs::path pluginFullPath, Plugin **ppPlugin)
         plugin->config.at("api").at("minor").get_to(plugin->api.minor);
         plugin->config.at("api").at("build").get_to(plugin->api.build);
 
+        if (plugin->config.contains("build_config")) // Added later, some plugins might not set
+        {
+            plugin->config.at("build_config").get_to(plugin->buildConfig);
+        }
+        else
+        {
+            plugin->buildConfig = "";
+        }
+
         // Let the host know about API, priority etc. 
         // Plugin has already populated OS, driver and other custom requirements.
         extCfg["feature"]["lastError"] = "ok";
         extCfg["feature"]["rhi"] = plugin->config.at("rhi");
-        extCfg["feature"]["supported"] = (plugin->context.supportedAdapters != 0 && extCfg.contains("/feature/supported"_json_pointer) ? extCfg["feature"]["supported"].operator bool() : true);
+        extCfg["feature"]["supported"] = (plugin->context.supportedAdapters != 0
+            && (extCfg.contains("/feature/supported"_json_pointer) ? extCfg["feature"]["supported"].operator bool() : true));
         extCfg["feature"]["unloaded"] = false;
         extCfg["feature"]["api"]["detected"] = plugin->api.toStr();
         extCfg["feature"]["api"]["requested"] = m_api.toStr();
@@ -674,11 +761,27 @@ Result PluginManager::mapPlugins(std::vector<fs::path>& files)
                 // one in the meantime.
                 if (plugin->api.major == m_api.major)
                 {
-                    // Compare the versions of these two plugins, if
-                    // pluginIsNewer then we should load it instead of p.
-                    if (plugin->version > duplicatedPluginById->version)
+                    // OTA override plugins are never replaced by bundled ones
+                    // regardless of version number.
+                    bool duplicateIsOtaOverride = m_otaOverridePaths.count(duplicatedPluginById->fullpath.wstring()) > 0;
+                    if (duplicateIsOtaOverride)
                     {
-                        SL_LOG_INFO("Plugin %s is newer (%s) will choose that", plugin->name.c_str(), plugin->version.toStr().c_str());
+                        // We know that the OTA override plugins are always at the front of the list, so the precedence is already handled.
+                        SL_LOG_INFO("Plugin %s v%s is an OTA override ('%ls'), keeping it over v%s ('%ls')",
+                            duplicatedPluginById->name.c_str(),
+                            duplicatedPluginById->version.toStr().c_str(),
+                            duplicatedPluginById->fullpath.wstring().c_str(),
+                            plugin->version.toStr().c_str(),
+                            plugin->fullpath.wstring().c_str());
+                    }
+                    else if (plugin->version > duplicatedPluginById->version)
+                    {
+                        SL_LOG_INFO("Plugin %s v%s ('%ls') supersedes v%s ('%ls')",
+                            plugin->name.c_str(),
+                            plugin->version.toStr().c_str(),
+                            plugin->fullpath.wstring().c_str(),
+                            duplicatedPluginById->version.toStr().c_str(),
+                            duplicatedPluginById->fullpath.wstring().c_str());
                         newerVersion = true;
                     }
                 }
@@ -696,7 +799,12 @@ Result PluginManager::mapPlugins(std::vector<fs::path>& files)
             }
             else if (duplicatedPluginById && !newerVersion)
             {
-                SL_LOG_WARN("Ignoring plugin '%s' since it has duplicated unique id", plugin->name.c_str());
+                SL_LOG_WARN("Ignoring plugin '%s' v%s ('%ls') - duplicate of already-loaded v%s ('%ls')",
+                    plugin->name.c_str(),
+                    plugin->version.toStr().c_str(),
+                    plugin->fullpath.wstring().c_str(),
+                    duplicatedPluginById->version.toStr().c_str(),
+                    duplicatedPluginById->fullpath.wstring().c_str());
                 freePlugin(&plugin);
 
                 // XXX[ljm] Plugins can inject global state in their 'onLoad'
@@ -710,7 +818,7 @@ Result PluginManager::mapPlugins(std::vector<fs::path>& files)
                 //
                 // Loop over our plugin list to find the duplicated plugin that
                 // we want to reload
-                for (auto it = m_plugins.begin(); it != m_plugins.end(); it++)
+                for (auto it = m_plugins.begin(); it != m_plugins.end(); )
                 {
                     if (*it == duplicatedPluginById)
                     {
@@ -720,12 +828,12 @@ Result PluginManager::mapPlugins(std::vector<fs::path>& files)
                         if (!loadPlugin(fullPath, &duplicatedPluginById))
                         {
                             SL_LOG_ERROR("Failed to reload plugin file: %ls it loaded before, so what happened!?", fullPath.wstring().c_str());
-                            m_plugins.erase(it);
+                            it = m_plugins.erase(it);
                             continue;
                         }
                         *it = duplicatedPluginById;
-                        continue;
                     }
+                    it++;
                 }
             }
             else
@@ -777,13 +885,15 @@ Result PluginManager::mapPlugins(std::vector<fs::path>& files)
             // unload the old plugin and remove it from the list.
             if (newerVersion)
             {
-                SL_LOG_INFO("A duplicate was found, but a newer plugin version was available");
                 for (auto it = m_plugins.begin(); it != m_plugins.end(); it++)
                 {
                     if (*it == duplicatedPluginById)
                     {
-                        // Remove the plugin from the list and free it
-                        SL_LOG_INFO("Removing plugin with name: %s superseded by plugin %s", duplicatedPluginById->name.c_str(), plugin->name.c_str());
+                        SL_LOG_INFO("Removing %s v%s ('%ls') replaced by v%s",
+                            duplicatedPluginById->name.c_str(),
+                            duplicatedPluginById->version.toStr().c_str(),
+                            duplicatedPluginById->fullpath.wstring().c_str(),
+                            plugin->version.toStr().c_str());
                         m_plugins.erase(it);
                         freePlugin(&duplicatedPluginById);
                         break;
@@ -793,8 +903,8 @@ Result PluginManager::mapPlugins(std::vector<fs::path>& files)
 
             if (plugin)
             {
-                SL_LOG_INFO("Loaded plugin '%s' - version %u.%u.%u.%s - id %u - priority %u - adapter mask 0x%x - interposer '%s'", plugin->name.c_str(), plugin->version.major, plugin->version.minor, plugin->version.build, 
-                    plugin->sha.c_str(), plugin->id, plugin->priority, plugin->context.supportedAdapters, pluginNeedsInterposer ? "yes" : "no");
+                SL_LOG_INFO("Loaded plugin '%s' - version %u.%u.%u.%s %s - id %u - priority %u - adapter mask 0x%x - interposer '%s'", plugin->name.c_str(), plugin->version.major, plugin->version.minor, plugin->version.build,
+                    plugin->sha.c_str(), plugin->buildConfig.c_str(), plugin->id, plugin->priority, plugin->context.supportedAdapters, pluginNeedsInterposer ? "yes" : "no");
             }
 
             if (plugin)
@@ -831,6 +941,7 @@ Result PluginManager::loadPlugins()
     // Here we know that we are either in eUnknown or ePluginsUnloaded state which are valid to restart
 
 #ifndef SL_PRODUCTION
+#if !defined(SL_UNITTEST_ONLY_CODE)
     auto interposerConfig = sl::interposer::getInterface()->getConfig();
     if (!interposerConfig.pathToPlugins.empty())
     {
@@ -843,16 +954,19 @@ Result PluginManager::loadPlugins()
         }
     }
 #endif
+#endif
 
     s_status = PluginManagerStatus::ePluginsLoaded;
 
-    // Kickoff OTA update, this function internally will check OTA preferences
+#if defined(SL_PRODUCTION) || defined(SL_UNITTEST_ONLY_CODE)
+    // On production builds kickoff OTA update, this function internally will
+    // check OTA preferences
     m_ota->readServerManifest();
+#endif
+#if defined(SL_PRODUCTION)
     bool requestOptionalUpdates = (m_pref.flags & PreferenceFlags::eAllowOTA);
-    for (Feature f : m_featuresToLoad)
-    {
-        m_ota->checkForOTA(f, m_api, requestOptionalUpdates);
-    }
+    m_ota->checkForOTA(m_api, requestOptionalUpdates);
+#endif
 
     //! Now let's enumerate SL plugins!
     //!
@@ -875,32 +989,67 @@ Result PluginManager::loadPlugins()
         }
     }
 
-    if (m_pref.flags & PreferenceFlags::eLoadDownloadedPlugins)
+#if defined(SL_PRODUCTION) || defined(SL_UNITTEST_ONLY_CODE)
+    // Only load plugins from OTA on production builds.
+    bool loadDownloadedPlugins = (m_pref.flags & PreferenceFlags::eLoadDownloadedPlugins);
+    bool otaOverride = m_ota->isOTAOverrideEnabled();
+
+    if (loadDownloadedPlugins || otaOverride)
     {
-        SL_LOG_INFO("Searching for OTA'd plugins...");
-        for (Feature f : m_featuresToLoad)
+        std::vector<fs::path> otaPluginList;
+
+        // Pass 1: if override is on, try override plugins (all-or-nothing)
+        if (otaOverride)
         {
-            fs::path pluginPath;
-            if (m_ota->getOTAPluginForFeature(f, m_api, pluginPath))
+            SL_LOG_INFO("OTA override DRS key is set, searching for override OTA'd plugins...");
+            if (findAllOTAPlugins(otaPluginList, true, true))
             {
-                SL_LOG_INFO("Found plugin: %ls", pluginPath.c_str());
-                if (f == kFeatureCommon)
+                for (const auto& p : otaPluginList)
                 {
-                    // Push kFeatureCommon OTA to front of list so sl.common is
-                    // loaded first+foremost
-                    pluginList.insert(pluginList.begin(), pluginPath);
+                    m_otaOverridePaths.insert(p.wstring());
+                }
+            }
+            else
+            {
+                if (loadDownloadedPlugins)
+                {
+                    SL_LOG_INFO("Not all override plugins available, falling back to non-override OTA plugins");
                 }
                 else
                 {
-                    pluginList.push_back(pluginPath);
+                    SL_LOG_INFO("Not all override plugins available, OTA'd plugins will not be loaded");
                 }
+                otaPluginList.clear();
             }
+        }
+
+        // Pass 2: if we don't have override plugins, try non-override (all-or-nothing).
+        // Only attempt this if eLoadDownloadedPlugins was actually set by the game.
+        if (otaPluginList.empty() && loadDownloadedPlugins)
+        {
+            SL_LOG_INFO("Searching for OTA'd plugins...");
+            if (!findAllOTAPlugins(otaPluginList, loadDownloadedPlugins, false))
+            {
+                SL_LOG_INFO("Unable to find all requested plugins in OTA cache, OTA'd plugins will not be loaded!");
+                otaPluginList.clear();
+            }
+        }
+
+        if (!otaPluginList.empty())
+        {
+            // Prepend OTA plugins so they appear before bundled plugins in the
+            // candidate list.  mapPlugins processes entries in order and keeps
+            // the first loaded copy of each feature, so earlier entries win.
+            pluginList.insert(pluginList.begin(), otaPluginList.begin(), otaPluginList.end());
         }
     }
     else
     {
         SL_LOG_INFO("eLoadDownloadedPlugins flag not passed to preferences, OTA'd plugins will not be loaded!");
     }
+#else
+    SL_LOG_INFO("SL_PRODUCTION not defined at build-time, OTA'd plugins will not be loaded!");
+#endif
 
     if (pluginList.empty())
     {
@@ -909,6 +1058,13 @@ Result PluginManager::loadPlugins()
     }
 
     param::getInterface()->set(param::global::kPluginPath, (void*)m_pluginPath.c_str());
+
+    // Expose the surface-to-HWND lookup function so plugins can call it without linking to the plugin manager
+    static auto s_getSurfaceWindow = +[](VkSurfaceKHR surface) -> HWND
+    {
+        return getInterface()->getSurfaceWindow(surface);
+    };
+    param::getInterface()->set(param::interposer::kPFunGetSurfaceWindow, (void*)s_getSurfaceWindow);
 
     SL_CHECK(mapPlugins(pluginList));
     
@@ -1058,6 +1214,7 @@ Result PluginManager::unloadPlugins()
     m_plugins.clear();
     m_featurePluginsMap.clear();
     m_featureExternalConfigMap.clear();
+    m_featureSupportedMap.clear();
     for (auto& hooks : m_afterHooks)
     {
         hooks.clear();
@@ -1167,10 +1324,25 @@ void PluginManager::populateLoaderJSON(uint32_t deviceType, json& config)
         config["ngx"]["engineType"] = m_engine;
         config["ngx"]["engineVersion"] = m_engineVersion;
         config["ngx"]["projectId"] = m_projectId;
+        
+#if defined(SL_UNITTEST_ONLY_CODE)
+        // Pass OTA cache path to plugins so they can sync their OTA path override
+        // NOTE: Only used for unit tests - do not rely on this in production plugins
+        std::filesystem::path ngxPath;
+        if (m_ota->getNGXPath(ngxPath))
+        {
+            config["ngx"]["otaCachePath"] = ngxPath.string();
+        }
+#endif
 
         config["preferences"]["flags"] = m_pref.flags;
+#if !defined(SL_UNITTEST_ONLY_CODE)
         config["interposerEnabled"] = sl::interposer::getInterface()->isEnabled();
         config["forceNonNVDA"] = sl::interposer::getInterface()->getConfig().forceNonNVDA;
+#else
+        config["interposerEnabled"] = false;
+        config["forceNonNVDA"] = false;
+#endif
     }
     catch (std::exception& e)
     {
@@ -1321,6 +1493,7 @@ void PluginManager::mapPluginCallbacks(Plugin* plugin)
     plugin->context.freeResources = (PFun_slFreeResources*)plugin->getFunction("slFreeResources");
     plugin->context.evaluate = (PFun_slEvaluateFeature*)plugin->getFunction("slEvaluateFeature");
     plugin->context.setTag = (PFun_slSetTag*)plugin->getFunction("slSetTag");
+    plugin->context.setTagForFrame = (PFun_slSetTagForFrame*)plugin->getFunction("slSetTagForFrame");
     plugin->context.setConstants = (PFun_slSetConstants*)plugin->getFunction("slSetConstants");
 
     SL_LOG_INFO("Callback %s:slSetData:0x%llx", plugin->name.c_str(), plugin->context.setData);
@@ -1329,6 +1502,7 @@ void PluginManager::mapPluginCallbacks(Plugin* plugin)
     SL_LOG_INFO("Callback %s:slFreeResources:0x%llx", plugin->name.c_str(), plugin->context.freeResources);
     SL_LOG_INFO("Callback %s:slEvaluateFeature:0x%llx", plugin->name.c_str(), plugin->context.evaluate);
     SL_LOG_INFO("Callback %s:slSetTag:0x%llx", plugin->name.c_str(), plugin->context.setTag);
+    SL_LOG_INFO("Callback %s:slSetTagForFrame:0x%llx", plugin->name.c_str(), plugin->context.setTagForFrame);
     SL_LOG_INFO("Callback %s:slSetConsts:0x%llx", plugin->name.c_str(), plugin->context.setConstants);
 }
 
@@ -1370,6 +1544,26 @@ const HookList& PluginManager::getAfterHooksWithoutLazyInit(FunctionHookID funct
     return m_afterHooks[(uint32_t)functionHookID];
 }
 
+void PluginManager::setSurfaceWindow(VkSurfaceKHR surface, HWND hwnd)
+{
+    m_surfaceWindows.emplace_back(surface, hwnd);
+}
+
+void PluginManager::removeSurfaceWindow(VkSurfaceKHR surface)
+{
+    m_surfaceWindows.erase(
+        std::remove_if(m_surfaceWindows.begin(), m_surfaceWindows.end(),
+            [surface](const auto& it) { return it.first == surface; }),
+        m_surfaceWindows.end());
+}
+
+HWND PluginManager::getSurfaceWindow(VkSurfaceKHR surface) const
+{
+    const auto it = std::find_if(m_surfaceWindows.begin(), m_surfaceWindows.end(),
+        [surface](const auto& entry) { return entry.first == surface; });
+    return (it != m_surfaceWindows.end()) ? it->second : NULL;
+}
+
 PluginManager::PluginManager()
 {
     m_version.major = VERSION_MAJOR;
@@ -1408,7 +1602,6 @@ uint32_t PluginManager::getFunctionHookID(const std::string& name)
 {
     return (uint32_t)m_functionHookIDMap.find(name)->second;
 }
-
 
 }
 }

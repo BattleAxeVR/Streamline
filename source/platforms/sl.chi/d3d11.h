@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2023 NVIDIA CORPORATION. All rights reserved
+* Copyright (c) 2022-2026 NVIDIA CORPORATION. All rights reserved
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to deal
@@ -51,6 +51,7 @@ struct KernelDataD3D11 : public KernelDataBase
 {
     ID3D11ComputeShader* shader = {};
     std::map<uint32_t, ID3D11Buffer*> constBuffers = {};
+    void destroy();
 };
 
 struct ResourceDriverDataD3D11
@@ -126,21 +127,37 @@ public:
     virtual ComputeStatus createKernel(void *InCubinBlob, unsigned int InCubinBlobSize, const char* fileName, const char *EntryPoint, Kernel &OutKernel) override final;
     virtual ComputeStatus destroyKernel(Kernel& kernel) override final;
 
-    virtual ComputeStatus createCommandListContext(CommandQueue queue, uint32_t count, ICommandListContext*& ctx, const char friendlyName[]) override final;
+    virtual ComputeStatus createCommandListContext(ChiCommandQueue* queue,
+                                                   uint32_t count,
+                                                   ICommandListContext*& ctx,
+                                                   const char friendlyName[]) override final;
     virtual ComputeStatus destroyCommandListContext(ICommandListContext* ctx) override final;
 
     virtual ComputeStatus createFence(FenceFlags flags, uint64_t initialValue, Fence& outFence, const char friendlyName[])  override final;
+    virtual WaitStatus waitCPUFence(Fence fence, uint64_t syncValue) override final;
 
-    virtual ComputeStatus createCommandQueue(CommandQueueType type, CommandQueue& queue, const char friendlyName[], uint32_t index) override final;
-    virtual ComputeStatus destroyCommandQueue(CommandQueue& queue) override final;
+    virtual ComputeStatus createCommandQueue(CommandQueueType type,
+                                             ChiCommandQueue*& queue,
+                                             const char friendlyName[],
+                                             uint32_t index) override final;
+    virtual ComputeStatus destroyCommandQueue(ChiCommandQueue* queue) override final;
 
     virtual ComputeStatus pushState(CommandList cmdList) override final;
     virtual ComputeStatus popState(CommandList cmdList) override final;
 
     virtual ComputeStatus setFullscreenState(SwapChain chain, bool fullscreen, Output out) override final;
-    virtual ComputeStatus getRefreshRate(SwapChain chain, float& refreshRate) override final;
     virtual ComputeStatus getSwapChainBuffer(SwapChain chain, uint32_t index, Resource& buffer) override final;
     
+    // Hybrid GPU support - D3D11 doesn't support hybrid GPU
+    virtual ComputeStatus notifySwapChainCreated(SwapChain chain, uint32_t bufferCount) override final { return ComputeStatus::eOk; }
+    virtual void notifySwapChainDestroyed(SwapChain chain) override final {}
+    virtual ChiCommandQueue* getHybridPresentationQueue() override final { return nullptr; }
+    virtual ComputeStatus copyFrameToHybridBackBuffer(SwapChain chain, Resource source,
+                                                      const HybridCopyParams& params,
+                                                      CommandQueue pacerQueue) override final { return ComputeStatus::eOk; }
+    virtual ComputeStatus waitForHybridCopyComplete(SwapChain chain) override final { return ComputeStatus::eOk; }
+    virtual ComputeStatus notifyHybridPresent(CommandQueue queue) override final { return ComputeStatus::eOk; }
+
     virtual ComputeStatus bindKernel(const Kernel InKernel) override final;
     virtual ComputeStatus bindSharedState(CommandList cmdList, UINT node) override final;
     virtual ComputeStatus bindSampler(uint32_t binding, uint32_t base, Sampler sampler) override final;
@@ -169,10 +186,9 @@ public:
 
     virtual ComputeStatus beginPerfSection(CommandList cmdList, const char *key, unsigned int node, bool InReset = false) override final;
     virtual ComputeStatus endPerfSection(CommandList cmdList, const char *key, float &OutAvgTimeMS, unsigned int node) override final;
-    virtual ComputeStatus beginProfiling(CommandList cmdList, UINT metadata, const char* marker) override final;
-    virtual ComputeStatus endProfiling(CommandList cmdList) override final;
+    virtual bool signalCPUFence(Fence fence, uint64_t syncValue) override final;
 
-    virtual ComputeStatus notifyOutOfBandCommandQueue(CommandQueue queue, OutOfBandCommandQueueType type) override final;
+    virtual ComputeStatus notifyOutOfBandCommandQueue(ChiCommandQueue* queue, OutOfBandCommandQueueType type) override final;
     virtual ComputeStatus setAsyncFrameMarker(CommandQueue queue, PCLMarker marker, uint64_t frameId) override final;
     virtual ComputeStatus setLatencyMarker(CommandQueue queue, PCLMarker marker, uint64_t frameId) override final;
 

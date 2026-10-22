@@ -22,9 +22,12 @@
 
 #include <dxgi1_6.h>
 #include <d3d11_4.h>
-#include <future>
-#include <map>
-#include <unordered_set>
+
+#include <algorithm>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
+#include <vector>
 
 #include "include/sl.h"
 #include "source/core/sl.api/internal.h"
@@ -36,26 +39,22 @@
 #include "source/core/sl.param/parameters.h"
 #include "source/core/sl.interposer/d3d12/d3d12.h"
 #include "source/core/sl.interposer/vulkan/layer.h"
-#include "source/core/sl.log/log.h"
 #include "source/plugins/sl.common/versions.h"
 #include "source/platforms/sl.chi/d3d12.h"
 #include "source/platforms/sl.chi/vulkan.h"
-#include "source/platforms/sl.chi/capture.h"
 #include "source/plugins/sl.common/commonInterface.h"
+#include "source/plugins/sl.common/resourceTaggingForFrame.h"
 #include "source/plugins/sl.common/commonDRSInterface.h"
 #include "source/plugins/sl.common/drs.h"
 #include "source/plugins/sl.pcl/pclImpl.h"
 #include "_artifacts/gitVersion.h"
 #include "_artifacts/json/common_json.h"
 
-#ifdef SL_WINDOWS
-#define NV_WINDOWS
 // NT_SUCCESS macro
 #include <winternl.h>
 // Needed for SHGetKnownFolderPath
 #include <ShlObj.h>
 #pragma comment(lib,"shlwapi.lib")
-#endif
 
 #include "external/ngx-sdk/include/nvsdk_ngx.h"
 #include "external/ngx-sdk/include/nvsdk_ngx_helpers.h"
@@ -65,6 +64,8 @@
 using json = nlohmann::json;
 
 PCLSTATS_DEFINE()
+
+#define SL_TAG_LOG_ENABLE 0
 
 namespace sl
 {
@@ -77,6 +78,10 @@ extern HRESULT slHookPresent(IDXGISwapChain* swapChain, UINT SyncInterval, UINT 
 extern HRESULT slHookAfterPresent(UINT Flags);
 extern HRESULT slHookPresent1(IDXGISwapChain* swapChain, UINT SyncInterval, UINT Flags, DXGI_PRESENT_PARAMETERS* params, bool& Skip);
 extern HRESULT slHookResizeSwapChainPre(IDXGISwapChain* swapChain, UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags, bool& Skip);
+
+extern HRESULT slHookCreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain, bool& Skip);
+extern HRESULT slHookCreateSwapChainForHwnd(IDXGIFactory2* pFactory, IUnknown* pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1* pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc, IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain, bool& Skip);
+extern HRESULT slHookCreateSwapChainForCoreWindow(IDXGIFactory2* pFactory, IUnknown* pDevice, IUnknown* pWindow, const DXGI_SWAP_CHAIN_DESC1* pDesc, IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain, bool& Skip);
 
 // VULKAN
 extern VkResult slHookVkPresent(VkQueue Queue, const VkPresentInfoKHR* PresentInfo, bool& Skip);
@@ -94,25 +99,6 @@ struct NGXContextStandard : public common::NGXContext
 
 struct NGXContextD3D12 : public common::NGXContext
 {
-};
-
-struct BufferTagInfo
-{
-    uint32_t viewportId{};
-    BufferType type{};
-    ResourceLifecycle lifecycle{};
-
-    inline bool operator==(const BufferTagInfo& rhs) const {
-        return viewportId == rhs.viewportId && type == rhs.type && lifecycle == rhs.lifecycle;
-    }
-};
-
-struct BufferTagInfoHash
-{
-    size_t operator()(const BufferTagInfo& info) const
-    {
-        return (size_t(info.viewportId) << 48) | (size_t(info.type) << 32) | size_t(info.lifecycle);
-    }
 };
 
 namespace common
@@ -134,8 +120,6 @@ struct CommonEntryContext
     bool needDX11On12 = false;
     bool needDRS = false;
 
-    std::unordered_set<BufferTagInfo, BufferTagInfoHash> requiredTags{};
-    
     NGXContextStandard ngxContext{};    // Regular context based on requested API from the host
     NGXContextD3D12 ngxContextD3D12{};  // Special context for plugins which run d3d11 on d3d12
 
@@ -148,15 +132,24 @@ struct CommonEntryContext
     chi::ICompute* computeD3D12{}; // Only valid when running D3D11 and some features require "d3d11 on 12"
     RenderAPI platform = RenderAPI::eD3D12;
 
-    std::mutex resourceTagMutex{};
-    std::map<uint64_t, CommonResource> idToResourceMap;
+    std::unique_ptr<ResourceTaggingBase> pBaseResourceTagging{};
     // Common constants must be set every frame, we allow up to 3 frames in flight
     common::ViewportIdFrameData<3, true> constants = { "common" };
+    std::unordered_map<Feature, std::vector<uint32_t>> featureViewportIds;
+    std::mutex featureViewportIdsMutex;
 
     // WAR for interposer < 2.3 which don't load PCL plugin.  PCL functionality will instead be handled in sl.common.
     PCLOptions pclOptions{};
     bool enablePCLPluginInCommonWAR = false;
+    // Updated from sl::Preferences flag for the same to track whether resource tagging is frame-based.
+    // In absence of common implementation or host SL SDK version check, this is necessary because legacy tagging API doesn't support
+    // frame-based resource-tagging and thereby resource-tagging for multiple frames in the same frame as required by some SL clients
+    // and is therefore not frame-aware.
+    bool useResourceTaggingForFrame = false;
+
+
 };
+
 }
 
 //! Embedded JSON, containing information about the plugin and the hooks it requires.
@@ -171,70 +164,48 @@ extern uint64_t getCurrentFrame();
 
 //! Thread safe get/set resource tag
 //! 
-void getCommonTag(BufferType tagType, uint32_t id, CommonResource& res, const sl::BaseStructure** inputs, uint32_t numInputs)
+void getCommonTag(BufferType tagType, uint32_t frameId, uint32_t viewportId, CommonResource& res, const sl::BaseStructure** inputs, uint32_t numInputs, bool optional)
 {
     auto& ctx = (*common::getContext());
 
-    //! First look for local tags
-    if (inputs)
+    if (ctx.pBaseResourceTagging == nullptr)
     {
-        std::vector<ResourceTag*> tags;
-        if (findStructs<ResourceTag>((const void**)inputs, numInputs, tags))
-        {
-            for (auto& tag : tags)
-            {
-                if (tag->type == tagType)
-                {
-                    res.extent = tag->extent;
-                    res.res = *tag->resource;
-
-                    // Optional extensions are chained after the tag they belong to
-                    PrecisionInfo* optPi = findStruct<PrecisionInfo>(tag->next);
-                    res.pi = optPi ? *optPi : PrecisionInfo{};
-
-                    //! Keep track of what tags are requested for what viewport (unique insert)
-                    //! 
-                    //! Note that the presence of a valid pointer to 'inputs' 
-                    //! indicates that we are called during the evaluate feature call.
-                    ctx.resourceTagMutex.lock();
-                    ctx.requiredTags.insert({ id, tagType, ResourceLifecycle::eValidUntilEvaluate });
-                    ctx.resourceTagMutex.unlock();
-                    return;
-                }
-            }
-        }
+        SL_LOG_ERROR("SL Resource tagging not properly initialized!");
+        assert("SL Resource tagging not properly initialized!" && false);
+        return;
     }
 
-    //! Now let's check the global ones
-    uint64_t uid = ((uint64_t)tagType << 32) | (uint64_t)id;
-    std::lock_guard<std::mutex> lock(ctx.resourceTagMutex);
-    CommonResource& resTmp = ctx.idToResourceMap[uid];
-    uint64_t uCurFrame = getCurrentFrame();
-    if (resTmp.uFrameWhenTagged != ~0ull && uCurFrame > resTmp.uFrameWhenTagged + 1)
-    {
-        if (resTmp)
-        {
-            SL_LOG_WARN("Tags are valid only until Present(). Invalidating the hanging tag %d for viewport %d (created at frame: %d, current frame: %d)", tagType, id, resTmp.uFrameWhenTagged, uCurFrame);
-            if (resTmp.clone)
-            {
-                ctx.pool->recycle(resTmp.clone);
-            }
-            else
-            {
-                ctx.compute->stopTrackingResource(uid, &resTmp.res);
-            }
-        }
-        resTmp = CommonResource();
-    }
-    res = resTmp;
-    //! Keep track of what tags are requested for what viewport (unique insert)
-    //! 
-    //! Note that the presence of a valid pointer to 'inputs' indicates that we are called
-    //! during the evaluate feature call, otherwise tag was requested from a hook (present etc.)
-    ctx.requiredTags.insert({ id, tagType, inputs ? ResourceLifecycle::eValidUntilEvaluate : ResourceLifecycle::eValidUntilPresent });
+    ctx.pBaseResourceTagging->getTag(tagType, frameId, viewportId, res, inputs, numInputs, optional);
 }
 
-sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32_t id, const Extent* ext, ResourceLifecycle lifecycle, CommandBuffer* cmdBuffer, bool localTag, const PrecisionInfo* pi)
+void recycleFramePresentEndResourceTags()
+{
+    auto& ctx = (*common::getContext());
+
+    if (ctx.pBaseResourceTagging == nullptr)
+    {
+        SL_LOG_ERROR("SL Resource tagging not properly initialized!");
+        assert("SL Resource tagging not properly initialized!" && false);
+        return;
+    }
+
+    if (ctx.useResourceTaggingForFrame)
+    {
+        auto pResourceTaggingForFrame = dynamic_cast<common::ResourceTaggingForFrame*>(ctx.pBaseResourceTagging.get());
+        assert(pResourceTaggingForFrame != nullptr);
+        pResourceTaggingForFrame->recycleTags();
+    }
+}
+
+sl::Result common::ResourceTaggingGeneral::setTag(const sl::Resource* resource,
+    BufferType tag,
+    uint32_t id,
+    const Extent* ext,
+    ResourceLifecycle lifecycle,
+    CommandBuffer* cmdBuffer,
+    bool localTag,
+    const PrecisionInfo* pi,
+    const sl::FrameToken& frame)
 {
     auto& ctx = (*common::getContext());
     uint64_t uid = ((uint64_t)tag << 32) | (uint64_t)id;
@@ -252,7 +223,7 @@ sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32
         // Check if state is provided but only if not running on D3D11
         if (ctx.platform != RenderAPI::eD3D11 && resource->state == UINT_MAX)
         {
-            SL_LOG_ERROR( "Resource state must be provided");
+            SL_LOG_ERROR("Resource state must be provided");
             return sl::Result::eErrorMissingResourceState;
         }
 #endif
@@ -263,16 +234,17 @@ sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32
         bool writeTag = tag == kBufferTypeScalingOutputColor || tag == kBufferTypeAmbientOcclusionDenoised ||
             tag == kBufferTypeShadowDenoised || tag == kBufferTypeSpecularHitDenoised || tag == kBufferTypeDiffuseHitDenoised ||
             tag == kBufferTypeBackbuffer;
+        writeTag = writeTag || tag == kBufferTypeUpliftOutputColor;
         if (!writeTag && lifecycle != ResourceLifecycle::eValidUntilPresent)
         {
             //! Only make a copy if this tag is required by at least one loaded and supported plugin on the same viewport and with immutable life-cycle.
             //! 
             //! If tag is required on present we have to make a copy always, if tag is required on evaluate
             //! we make a copy only if buffer is tagged as "valid only now" and this is not a local tag.
-            ctx.resourceTagMutex.lock();
-            auto requiredOnPresent = ctx.requiredTags.find({ id, tag, ResourceLifecycle::eValidUntilPresent }) != ctx.requiredTags.end();
-            auto requiredOnEvaluate = ctx.requiredTags.find({ id, tag, ResourceLifecycle::eValidUntilEvaluate }) != ctx.requiredTags.end();
-            ctx.resourceTagMutex.unlock();
+            resourceTagMutex.lock();
+            auto requiredOnPresent = requiredTags.find({ id, tag, ResourceLifecycle::eValidUntilPresent }) != requiredTags.end();
+            auto requiredOnEvaluate = requiredTags.find({ id, tag, ResourceLifecycle::eValidUntilEvaluate }) != requiredTags.end();
+            resourceTagMutex.unlock();
             auto makeCopy = requiredOnPresent || (requiredOnEvaluate && lifecycle == ResourceLifecycle::eOnlyValidNow && !localTag);
 
             if (makeCopy)
@@ -288,9 +260,9 @@ sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32
                 auto actualResource = (chi::Resource)resource;
 
                 // Quick peek at the previous tag with the same id
-                ctx.resourceTagMutex.lock();
-                auto prevTag = ctx.idToResourceMap[uid];
-                ctx.resourceTagMutex.unlock();
+                resourceTagMutex.lock();
+                auto prevTag = idToResourceMap[uid];
+                resourceTagMutex.unlock();
 
                 if (prevTag.clone)
                 {
@@ -302,7 +274,13 @@ sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32
                 }
 
                 // Defaults to eCopyDestination state 
-                cr.clone = ctx.pool->allocate(actualResource, extra::format("sl.tag.{}.volatile.{}", sl::getBufferTypeAsStr(tag), id).c_str());
+                cr.clone = ctx.pool->allocate(actualResource, (SL_RESOURCE_NAME("clone.tagVolatile.") + sl::getBufferTypeAsStr(tag) + "." + std::to_string(id)).c_str());
+
+                if (!cr.clone)
+                {
+                    // ResourcePool::allocate already logs the clone failure (with resource name + hash).
+                    return Result::eErrorComputeFailed;
+                }
 
                 // Get tagged resource's state
                 chi::ResourceState state{};
@@ -350,8 +328,8 @@ sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32
         }
     }
 
-    std::lock_guard<std::mutex> lock(ctx.resourceTagMutex);
-    auto& prevTag = ctx.idToResourceMap[uid];
+    std::lock_guard<std::mutex> lock(resourceTagMutex);
+    auto& prevTag = idToResourceMap[uid];
     if (prevTag.clone && !cr.clone)
     {
         // Host can set null as a tag or even change the life-cycle of a tag, in that case any previously allocated copies must be recycled
@@ -361,16 +339,104 @@ sl::Result slSetTagInternal(const sl::Resource* resource, BufferType tag, uint32
     return Result::eOk;
 }
 
-
-// For future reference, this function supports setting tags in 3 ways:
-//  * An array of ResourceTags
-//  * A linked-list of ResourceTags, using the `next` ptr to navigate the linked-list
-//  * A hybrid approach
-// Extensions usage:
-//  Additionally, we support extensions to ResourceTags via the `next` ptr.
-//  The requirement is that when setting tags, the developer should chain the extensions right after the tag that they belong to.
-sl::Result slSetTag(const sl::ViewportHandle& viewport, const sl::ResourceTag* resources, uint32_t numResources, sl::CommandBuffer* cmdBuffer)
+//! Thread safe get/set resource tag
+//! 
+void common::ResourceTaggingGeneral::getTag(BufferType tagType, uint32_t frameId, uint32_t viewportId, CommonResource& res, const sl::BaseStructure** inputs, uint32_t numInputs, bool optional)
 {
+    auto& ctx = (*common::getContext());
+
+    //! First look for local tags
+    if (inputs)
+    {
+        std::vector<ResourceTag*> tags;
+        if (findStructs<ResourceTag>((const void**)inputs, numInputs, tags))
+        {
+            for (auto& tag : tags)
+            {
+                if (tag->type == tagType)
+                {
+                    res.extent = tag->extent;
+                    res.res = *tag->resource;
+
+                    // Optional extensions are chained after the tag they belong to
+                    PrecisionInfo* optPi = findStruct<PrecisionInfo>(tag->next);
+                    res.pi = optPi ? *optPi : PrecisionInfo{};
+
+                    //! Keep track of what tags are requested for what viewport (unique insert)
+                    //! 
+                    //! Note that the presence of a valid pointer to 'inputs' 
+                    //! indicates that we are called during the evaluate feature call.
+                    std::lock_guard<std::mutex> lock(resourceTagMutex);
+                    requiredTags.insert({ viewportId, tagType, ResourceLifecycle::eValidUntilEvaluate });
+
+                    return;
+                }
+            }
+        }
+    }
+
+    //! Now let's check the global ones
+    uint64_t uid = ((uint64_t)tagType << 32) | (uint64_t)viewportId;
+    std::lock_guard<std::mutex> lock(resourceTagMutex);
+    // legacy tag-retrieval implementation
+    CommonResource& resTmp = idToResourceMap[uid];
+    uint64_t uCurFrame = getCurrentFrame();
+    if (resTmp.uFrameWhenTagged != ~0ull && uCurFrame > resTmp.uFrameWhenTagged + 1)
+    {
+        if (resTmp)
+        {
+            SL_LOG_WARN("Tags are valid only until Present(). Invalidating the hanging tag %d for viewport %d (created at frame: %d, current frame: %d)", tagType, viewportId, resTmp.uFrameWhenTagged, uCurFrame);
+            if (resTmp.clone)
+            {
+                ctx.pool->recycle(resTmp.clone);
+            }
+            else
+            {
+                ctx.compute->stopTrackingResource(uid, &resTmp.res);
+            }
+        }
+        resTmp = CommonResource();
+    }
+    res = resTmp;
+
+    //! Keep track of what tags are requested for what viewport (unique insert)
+    //! 
+    //! Note that the presence of a valid pointer to 'inputs' indicates that we are called
+    //! during the evaluate feature call, otherwise tag was requested from a hook (present etc.)
+    requiredTags.insert({ viewportId, tagType, inputs ? ResourceLifecycle::eValidUntilEvaluate : ResourceLifecycle::eValidUntilPresent });
+}
+
+common::ResourceTaggingGeneral::~ResourceTaggingGeneral()
+{
+    auto& ctx = (*common::getContext());
+
+    assert(ctx.pool != nullptr);
+    assert(ctx.compute != nullptr);
+
+    std::lock_guard<std::mutex> lock(resourceTagMutex);
+    requiredTags.clear();
+
+    for (auto&[resourceTagId, resourceTag] : idToResourceMap)
+    {
+        ctx.pool->recycle(resourceTag.clone);
+        ctx.compute->stopTrackingResource(resourceTagId, &resourceTag.res);
+        resourceTag = {};
+    }
+
+    idToResourceMap.clear();
+}
+
+sl::Result setTagCommon(const sl::ViewportHandle& viewport, const sl::ResourceTag* resources, uint32_t numResources, sl::CommandBuffer* cmdBuffer, const sl::FrameToken& frame)
+{
+    auto& ctx = (*common::getContext());
+
+    if (ctx.pBaseResourceTagging == nullptr)
+    {
+        SL_LOG_ERROR("SL Resource tagging not properly initialized!");
+        assert("SL Resource tagging not properly initialized!" && false);
+        return Result::eErrorNotInitialized;
+    }
+
     for (uint32_t i = 0; i < numResources; i++)
     {
         auto tag = &resources[i];
@@ -378,12 +444,32 @@ sl::Result slSetTag(const sl::ViewportHandle& viewport, const sl::ResourceTag* r
         {
             // Find the optional extension PrecisionInfo, until we see a ResourceTag (or nullptr) in the linked list
             PrecisionInfo* optPi = findStruct<PrecisionInfo, ResourceTag>(tag->next);
-            SL_CHECK(slSetTagInternal(tag->resource, tag->type, viewport, &tag->extent, tag->lifecycle, cmdBuffer, false, optPi));
+            SL_CHECK(ctx.pBaseResourceTagging->setTag(tag->resource, tag->type, viewport, &tag->extent, tag->lifecycle, cmdBuffer, false, optPi, frame));
 
             tag = findStruct<ResourceTag>(tag->next);
         }
     }
+
     return sl::Result::eOk;
+}
+
+sl::Result slSetTag(const sl::ViewportHandle& viewport, const sl::ResourceTag* resources, uint32_t numResources, sl::CommandBuffer* cmdBuffer)
+{
+    auto& ctx = (*common::getContext());
+    chi::ScopedProfilingSection ScopedSection(ctx.compute, cmdBuffer, __FUNCTION__, resources, numResources);
+    if (ctx.useResourceTaggingForFrame)
+    {
+        SL_LOG_ERROR("Deprecated SL API slSetTag and the new API slSetTagForFrame are both being invalidly used in the same application! Please switch to slSetTagForFrame API.");
+        return Result::eErrorInvalidIntegration;
+    }
+
+    return setTagCommon(viewport, resources, numResources, cmdBuffer, FrameHandleImplementation{});
+}
+
+sl::Result slSetTagForFrame(const sl::FrameToken& frame, const sl::ViewportHandle& viewport, const sl::ResourceTag* resources, uint32_t numResources, sl::CommandBuffer* cmdBuffer)
+{
+    chi::ScopedProfilingSection ScopedSection((*common::getContext()).compute, cmdBuffer, __FUNCTION__, resources, numResources);
+    return setTagCommon(viewport, resources, numResources, cmdBuffer, frame);
 }
 
 //! Make sure host has provided common constants and
@@ -455,8 +541,54 @@ common::GetDataResult getCommonConstants(const common::EventData& ev, Constants*
     return (*common::getContext()).constants.get(ev, consts);
 }
 
+void registerCommonFeatureViewport(Feature feature, uint32_t viewportId)
+{
+    auto& ctx = (*common::getContext());
+    std::lock_guard<std::mutex> lock(ctx.featureViewportIdsMutex);
+    auto& viewportIds = ctx.featureViewportIds[feature];
+    if (std::find(viewportIds.begin(), viewportIds.end(), viewportId) == viewportIds.end())
+    {
+        viewportIds.push_back(viewportId);
+    }
+}
+
+void unregisterCommonFeatureViewport(Feature feature, uint32_t viewportId)
+{
+    auto& ctx = (*common::getContext());
+    std::lock_guard<std::mutex> lock(ctx.featureViewportIdsMutex);
+    auto it = ctx.featureViewportIds.find(feature);
+    if (it != ctx.featureViewportIds.end())
+    {
+        auto& viewportIds = it->second;
+        viewportIds.erase(std::remove(viewportIds.begin(), viewportIds.end(), viewportId), viewportIds.end());
+        if (viewportIds.empty())
+        {
+            ctx.featureViewportIds.erase(it);
+        }
+    }
+}
+
+namespace common
+{
+bool getFeatureViewports(Feature feature, std::vector<uint32_t>& viewportIds)
+{
+    auto& ctx = (*common::getContext());
+    std::lock_guard<std::mutex> lock(ctx.featureViewportIdsMutex);
+    auto it = ctx.featureViewportIds.find(feature);
+    if (it == ctx.featureViewportIds.end())
+    {
+        viewportIds.clear();
+        return false;
+    }
+    viewportIds = it->second;
+    return !viewportIds.empty();
+}
+}
+
 sl::Result slEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame, const sl::BaseStructure** inputs, uint32_t numInputs, sl::CommandBuffer* cmdBuffer)
 {
+
+    chi::ScopedProfilingSection ScopedSection((*common::getContext()).compute, cmdBuffer, __FUNCTION__, feature);
     // Check if host provided tags or constants in the eval call
 
     auto viewport = findStruct<ViewportHandle>((const void**)inputs, numInputs);
@@ -469,7 +601,16 @@ sl::Result slEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame, c
     //! Look for local tags that won't be valid later on
     if (inputs)
     {
-        std::vector<ResourceTag*> tags;
+        auto& ctx = (*common::getContext());
+
+        if (ctx.pBaseResourceTagging == nullptr)
+        {
+            SL_LOG_ERROR("SL Resource tagging not properly initialized!");
+            assert("SL Resource tagging not properly initialized!" && false);
+            return Result::eErrorNotInitialized;
+        }
+
+        std::vector<ResourceTag*> tags{};
         if (findStructs<ResourceTag>((const void**)inputs, numInputs, tags))
         {
             for (auto& tag : tags)
@@ -480,13 +621,48 @@ sl::Result slEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame, c
                     PrecisionInfo* optPi = findStruct<PrecisionInfo>(tag->next);
 
                     //! Temporary tag, hence passing true
-                    SL_CHECK(slSetTagInternal(tag->resource, tag->type, *viewport, &tag->extent, tag->lifecycle, cmdBuffer, true, optPi));
+                    SL_CHECK(ctx.pBaseResourceTagging->setTag(tag->resource, tag->type, *viewport, &tag->extent, tag->lifecycle, cmdBuffer, true, optPi, frame));
                 }
             }
         }
     }
 
     return slEvaluateFeatureInternal(feature, frame, inputs, numInputs, cmdBuffer);
+}
+
+bool getStringFromModule(const char* moduleName, const char* stringName, std::string& value)
+{
+    TCHAR filename[MAX_PATH + 1]{};
+    //if (GetModuleFileName(GetModuleHandle(moduleName), filename, MAX_PATH) == 0)
+    {
+        wchar_t* slPluginPathUtf16{};
+        param::getPointerParam(api::getContext()->parameters, param::global::kPluginPath, &slPluginPathUtf16);
+        if (!slPluginPathUtf16) return false;
+        std::string path = extra::utf16ToUtf8(slPluginPathUtf16) + std::string("\\") + moduleName;
+        strcpy_s(filename, MAX_PATH + 1, path.c_str());
+    }
+
+    DWORD dummy;
+    auto size = GetFileVersionInfoSize(filename, &dummy);
+    if (size == 0)
+    {
+        return false;
+    }
+    std::vector<BYTE> data(size);
+
+    if (!GetFileVersionInfo(filename, NULL, size, &data[0]))
+    {
+        return false;
+    }
+
+    LPVOID stringValue = NULL;
+    uint32_t stringValueLen = 0;
+    if (!VerQueryValueA(&data[0], (std::string("\\StringFileInfo\\040904e4\\") + stringName).c_str(), &stringValue, &stringValueLen))
+    {
+        return false;
+    }
+    value = (const char*)stringValue;
+    return true;
 }
 
 namespace ngx
@@ -497,25 +673,99 @@ namespace ngx
 //! Common spot for all NGX functionality, create/eval/release feature
 //! 
 //! Shared with all other plugins as NGXContext
-//! 
+//!
+
+// Workaround (bug 5911849): nvngx_dlssg.dll versions prior to 310.2.2 will
+// crash if NVSDK_NGX_VULKAN_CreateFeature1 is used. Query the DLL's FileVersion
+// on first call and cache the result so we only pay the lookup cost once.
+bool shouldSkipVulkanCreateFeature1(NVSDK_NGX_Feature feature)
+{
+    if (feature != NVSDK_NGX_Feature_FrameGeneration)
+    {
+        return false;
+    }
+
+    static std::optional<bool> cachedShouldSkipCreateFeature1 = std::nullopt;
+    if (cachedShouldSkipCreateFeature1.has_value())
+    {
+        return cachedShouldSkipCreateFeature1.value();
+    }
+
+    std::string productNameStr;
+    if (!getStringFromModule("nvngx_dlssg.dll", "ProductName", productNameStr))
+    {
+        // Can't access nvngx_dlssg.dll, assume CreateFeature1 is supported
+        cachedShouldSkipCreateFeature1 = false;
+        return false;
+    }
+
+    if (productNameStr == "NVIDIA DLSS-G")
+    {
+        // DLLs with product name exactly equal to "NVIDIA DLSS-G" don't have
+        // the bug that causes the crash, so we can use CreateFeature1
+        cachedShouldSkipCreateFeature1 = false;
+        return false;
+    }
+
+    // Version 310.2.2 and above support CreateFeature1
+    const Version kMinDlssgVersionForCreateFeature1(310, 2, 2);
+
+    std::string versionStr;
+    if (getStringFromModule("nvngx_dlssg.dll", "FileVersion", versionStr))
+    {
+        std::replace(versionStr.begin(), versionStr.end(), ',', '.');
+        Version dllVersion;
+        if (sscanf_s(versionStr.c_str(), "%u.%u.%u", &dllVersion.major, &dllVersion.minor, &dllVersion.build) == 3)
+        {
+            if (dllVersion < kMinDlssgVersionForCreateFeature1)
+            {
+                SL_LOG_INFO("nvngx_dlssg.dll version %s < %s - skipping VULKAN_CreateFeature1 for FrameGeneration",
+                    dllVersion.toStr().c_str(), kMinDlssgVersionForCreateFeature1.toStr().c_str());
+                cachedShouldSkipCreateFeature1 = true;
+                return true;
+            }
+        }
+    }
+
+    cachedShouldSkipCreateFeature1 = false;
+    return false;
+}
+
 bool createNGXFeature(void* cmdList, NVSDK_NGX_Feature feature, NVSDK_NGX_Handle** handle, const char* id)
 {
     auto& ctx = (*common::getContext());
 
     extra::ScopedTasks vram([&ctx, id]()->void {ctx.compute->beginVRAMSegment(id); }, [&ctx]()->void {ctx.compute->endVRAMSegment(); });
 
+    NVSDK_NGX_Result status{};
     if (ctx.platform == RenderAPI::eD3D11)
     {
-        CHECK_NGX_RETURN_ON_ERROR(NVSDK_NGX_D3D11_CreateFeature((ID3D11DeviceContext*)cmdList, feature, ctx.ngxContext.params, handle));
+        status = NVSDK_NGX_D3D11_CreateFeature((ID3D11DeviceContext*)cmdList, feature, ctx.ngxContext.params, handle);
     }
     else if (ctx.platform == RenderAPI::eD3D12)
     {
-        CHECK_NGX_RETURN_ON_ERROR(NVSDK_NGX_D3D12_CreateFeature((ID3D12GraphicsCommandList*)cmdList, feature, ctx.ngxContext.params, handle));
+        status = NVSDK_NGX_D3D12_CreateFeature((ID3D12GraphicsCommandList*)cmdList, feature, ctx.ngxContext.params, handle);
     }
     else
     {
-        CHECK_NGX_RETURN_ON_ERROR(NVSDK_NGX_VULKAN_CreateFeature((VkCommandBuffer)cmdList, feature, ctx.ngxContext.params, handle));
+        status = NVSDK_NGX_Result_FAIL_NotImplemented;
+
+        if (!shouldSkipVulkanCreateFeature1(feature))
+        {
+            // Vulkan can't query device from command buffer, so we provide it ourselves.
+            chi::Device device;
+            CHI_CHECK_RF(ctx.compute->getDevice(device));
+            status = NVSDK_NGX_VULKAN_CreateFeature1((VkDevice)device, (VkCommandBuffer)cmdList, feature, ctx.ngxContext.params, handle);
+        }
+
+        // Some old features don't support CreateFeature1, so fall back to CreateFeature.
+        if (status == NVSDK_NGX_Result_FAIL_NotImplemented || status == NVSDK_NGX_Result_FAIL_UnableToInitializeFeature)
+        {
+            status = NVSDK_NGX_VULKAN_CreateFeature((VkCommandBuffer)cmdList, feature, ctx.ngxContext.params, handle);
+        }
     }
+
+    if (status != NVSDK_NGX_Result_Success) { SL_LOG_ERROR("[%s] NGX create feature failed 0x%x", id, status); return false; }
     return true;
 }
 
@@ -525,18 +775,21 @@ bool evaluateNGXFeature(void* cmdList, NVSDK_NGX_Handle* handle, const char* id)
 
     extra::ScopedTasks vram([&ctx, id]()->void {ctx.compute->beginVRAMSegment(id); }, [&ctx]()->void {ctx.compute->endVRAMSegment(); });
 
+    NVSDK_NGX_Result status{};
     if (ctx.platform == RenderAPI::eD3D11)
     {
-        CHECK_NGX_RETURN_ON_ERROR(NVSDK_NGX_D3D11_EvaluateFeature((ID3D11DeviceContext*)cmdList, handle, ctx.ngxContext.params, nullptr));
+        status = NVSDK_NGX_D3D11_EvaluateFeature((ID3D11DeviceContext*)cmdList, handle, ctx.ngxContext.params, nullptr);
     }
     else if (ctx.platform == RenderAPI::eD3D12)
     {
-        CHECK_NGX_RETURN_ON_ERROR(NVSDK_NGX_D3D12_EvaluateFeature((ID3D12GraphicsCommandList*)cmdList, handle, ctx.ngxContext.params, nullptr));
+        status = NVSDK_NGX_D3D12_EvaluateFeature((ID3D12GraphicsCommandList*)cmdList, handle, ctx.ngxContext.params, nullptr);
     }
     else
     {
-        CHECK_NGX_RETURN_ON_ERROR(NVSDK_NGX_VULKAN_EvaluateFeature((VkCommandBuffer)cmdList, handle, ctx.ngxContext.params, nullptr));
+        status = NVSDK_NGX_VULKAN_EvaluateFeature((VkCommandBuffer)cmdList, handle, ctx.ngxContext.params, nullptr);
     }
+
+    if (status != NVSDK_NGX_Result_Success) { SL_LOG_ERROR("[%s] NGX evaluate feature failed 0x%x", id, status); return false; }
     return true;
 }
 
@@ -546,18 +799,21 @@ bool releaseNGXFeature(NVSDK_NGX_Handle* handle, const char* id)
 
     extra::ScopedTasks vram([&ctx, id]()->void {ctx.compute->beginVRAMSegment(id); }, [&ctx]()->void {ctx.compute->endVRAMSegment(); });
 
+    NVSDK_NGX_Result status{};
     if (ctx.platform == RenderAPI::eD3D11)
     {
-        CHECK_NGX_RETURN_ON_ERROR(NVSDK_NGX_D3D11_ReleaseFeature(handle));
+        status = NVSDK_NGX_D3D11_ReleaseFeature(handle);
     }
     else if (ctx.platform == RenderAPI::eD3D12)
     {
-        CHECK_NGX_RETURN_ON_ERROR(NVSDK_NGX_D3D12_ReleaseFeature(handle));
+        status = NVSDK_NGX_D3D12_ReleaseFeature(handle);
     }
     else
     {
-        CHECK_NGX_RETURN_ON_ERROR(NVSDK_NGX_VULKAN_ReleaseFeature(handle));
+        status = NVSDK_NGX_VULKAN_ReleaseFeature(handle);
     }
+
+    if (status != NVSDK_NGX_Result_Success) { SL_LOG_ERROR("[%s] NGX release feature failed 0x%x", id, status); return false; }
     return true;
 }
 
@@ -657,7 +913,7 @@ bool getNGXFeatureRequirements(NVSDK_NGX_Feature feature, common::PluginInfo& pl
             NVSDK_NGX_FeatureDiscoveryInfo info{};
             info.FeatureID = feature;
             info.SDKVersion = NVSDK_NGX_Version_API;
-            info.ApplicationDataPath = file::getTmpPath();
+            info.ApplicationDataPath = pluginPath;
             info.Identifier = applicationId;
             info.FeatureInfo = &featureInfo;
             NVSDK_NGX_Result ngxResult{};
@@ -678,12 +934,7 @@ bool getNGXFeatureRequirements(NVSDK_NGX_Feature feature, common::PluginInfo& pl
                     assert(pluginInfo.opticalFlowInfo.queueIndex == 0);
                     SL_LOG_INFO("Native VK OFA feature supported on this device!");
 
-                    pluginInfo.minDriver =
-#ifdef SL_WINDOWS
-                        Version(527, 64, 0);
-#elif defined(SL_LINUX)
-                        Version(525, 72, 0);
-#endif
+                    pluginInfo.minDriver = Version(527, 64, 0);
                     pluginInfo.minVkAPIVersion = VK_API_VERSION_1_1;
                 }
                 else
@@ -727,7 +978,9 @@ bool getNGXFeatureRequirements(NVSDK_NGX_Feature feature, common::PluginInfo& pl
             {
                 // This will ensure to trigger "no adapter found" error if no other compatible adapter is found
                 pluginInfo.minGPUArchitecture = UINT_MAX;
-                return true;
+                // Maybe there is another NVDA adapter, move on
+                SL_LOG_INFO("NGX_*_GetFeatureRequirements returned 0x%x for adapter: %d feature: %u", ngxResult, i, feature);
+                continue;
             }
 
             CHECK_NGX_RETURN_ON_ERROR(ngxResult);
@@ -744,6 +997,7 @@ bool getNGXFeatureRequirements(NVSDK_NGX_Feature feature, common::PluginInfo& pl
             if (result.FeatureSupported & NVSDK_NGX_FeatureSupportResult_NotImplemented)
             {
                 // Just use SL defaults, NGX is out of date
+                SL_LOG_INFO("NGX_*_GetFeatureRequirements feature: %u FeatureSupported == NotImplemented", feature);
                 return false;
             }
             if (result.FeatureSupported & NVSDK_NGX_FeatureSupportResult_AdapterUnsupported)
@@ -751,18 +1005,21 @@ bool getNGXFeatureRequirements(NVSDK_NGX_Feature feature, common::PluginInfo& pl
                 // This will ensure to trigger "no adapter found" error if no other compatible adapter is found
                 pluginInfo.minGPUArchitecture = UINT_MAX;
                 // Maybe there is another NVDA adapter, move on
+                SL_LOG_INFO("NGX_*_GetFeatureRequirements feature: %u FeatureSupported == AdapterUnsupported", feature);
                 continue;
             }
             if (result.FeatureSupported & NVSDK_NGX_FeatureSupportResult_OSVersionBelowMinimumSupported)
             {
                 // Increment detected OS version to trigger "OS out of date" error
                 pluginInfo.minOS = Version(ctx.caps->osVersionMajor, ctx.caps->osVersionMinor, ctx.caps->osVersionBuild + 1);
+                SL_LOG_INFO("NGX_*_GetFeatureRequirements feature: %u FeatureSupported == OSVersionBelowMinimumSupported", feature);
             }
             if (result.FeatureSupported & NVSDK_NGX_FeatureSupportResult_DriverVersionUnsupported)
             {
                 // Unfortunately NGX does not tell us which driver it needs so we just increment 
                 // detected version to trigger "driver out of date" error
                 pluginInfo.minDriver = Version(ctx.caps->driverVersionMajor, ctx.caps->driverVersionMinor + 1, 0);
+                SL_LOG_INFO("NGX_*_GetFeatureRequirements feature: %u FeatureSupported == DriverVersionUnsupported", feature);
             }
             
         }
@@ -777,7 +1034,8 @@ bool createNGXFeatureD3D12(void* cmdList, NVSDK_NGX_Feature feature, NVSDK_NGX_H
 {
     auto& ctx = (*common::getContext());
     extra::ScopedTasks vram([&ctx, id]()->void {ctx.computeD3D12->beginVRAMSegment(id); }, [&ctx]()->void {ctx.computeD3D12->endVRAMSegment(); });
-    CHECK_NGX_RETURN_ON_ERROR(NVSDK_NGX_D3D12_CreateFeature((ID3D12GraphicsCommandList*)cmdList, feature, ctx.ngxContextD3D12.params, handle));
+    NVSDK_NGX_Result status = NVSDK_NGX_D3D12_CreateFeature((ID3D12GraphicsCommandList*)cmdList, feature, ctx.ngxContextD3D12.params, handle);
+    if (status != NVSDK_NGX_Result_Success) { SL_LOG_ERROR("[%s] NGX create feature (D3D12) failed 0x%x", id, status); return false; }
     return true;
 }
 
@@ -785,7 +1043,8 @@ bool evaluateNGXFeatureD3D12(void* cmdList, NVSDK_NGX_Handle* handle, const char
 {
     auto& ctx = (*common::getContext());
     extra::ScopedTasks vram([&ctx, id]()->void {ctx.computeD3D12->beginVRAMSegment(id); }, [&ctx]()->void {ctx.computeD3D12->endVRAMSegment(); });
-    CHECK_NGX_RETURN_ON_ERROR(NVSDK_NGX_D3D12_EvaluateFeature((ID3D12GraphicsCommandList*)cmdList, handle, ctx.ngxContextD3D12.params, nullptr));
+    NVSDK_NGX_Result status = NVSDK_NGX_D3D12_EvaluateFeature((ID3D12GraphicsCommandList*)cmdList, handle, ctx.ngxContextD3D12.params, nullptr);
+    if (status != NVSDK_NGX_Result_Success) { SL_LOG_ERROR("[%s] NGX evaluate feature (D3D12) failed 0x%x", id, status); return false; }
     return true;
 }
 
@@ -793,7 +1052,8 @@ bool releaseNGXFeatureD3D12(NVSDK_NGX_Handle* handle, const char* id)
 {
     auto& ctx = (*common::getContext());
     extra::ScopedTasks vram([&ctx, id]()->void {ctx.computeD3D12->beginVRAMSegment(id); }, [&ctx]()->void {ctx.computeD3D12->endVRAMSegment(); });
-    CHECK_NGX_RETURN_ON_ERROR(NVSDK_NGX_D3D12_ReleaseFeature(handle));
+    NVSDK_NGX_Result status = NVSDK_NGX_D3D12_ReleaseFeature(handle);
+    if (status != NVSDK_NGX_Result_Success) { SL_LOG_ERROR("[%s] NGX release feature (D3D12) failed 0x%x", id, status); return false; }
     return true;
 }
 
@@ -821,10 +1081,19 @@ void allocateNGXBufferCallback(D3D11_BUFFER_DESC* desc, ID3D11Buffer** resource)
         resDesc.heapType = chi::HeapType::eHeapTypeDefault;
     }
 
-    ctx.compute->createBuffer(resDesc, res);
-    
-    *resource = (ID3D11Buffer*)(res->native);
-    delete res;
+    const auto resourceName{ SL_COMPOSE_NAME("sl", "buf.resource") };
+    if (sl::chi::ComputeStatus::eOk == ctx.compute->createBuffer(resDesc, res, resourceName.c_str()))
+    {
+        SL_LOG_VERBOSE("Allocated NGX buffer '%s' of width %d", resourceName.c_str(), resDesc.width);
+        *resource = (ID3D11Buffer*)(res->native);
+        delete res;
+    }
+    else
+    {
+        SL_LOG_ERROR("Creating an NGX buffer failed: width=%d", resDesc.width);
+        // make sure to return nullptr to the caller.
+        *resource = nullptr;
+    }
 }
 
 void allocateNGXTex2dCallback(D3D11_TEXTURE2D_DESC* desc, ID3D11Texture2D** resource)
@@ -851,10 +1120,19 @@ void allocateNGXTex2dCallback(D3D11_TEXTURE2D_DESC* desc, ID3D11Texture2D** reso
         resDesc.heapType = chi::HeapType::eHeapTypeDefault;
     }
 
-    ctx.compute->createTexture2D(resDesc, res);
-
-    *resource = (ID3D11Texture2D*)(res->native);
-    delete res;
+    const auto resourceName{ SL_COMPOSE_NAME("sl", "tex2d.resource") };
+    if (sl::chi::ComputeStatus::eOk == ctx.compute->createTexture2D(resDesc, res, resourceName.c_str()))
+    {
+        SL_LOG_VERBOSE("Allocated NGX resource '%s'", resourceName.c_str());
+        *resource = (ID3D11Texture2D*)(res->native);
+        delete res;
+    }
+    else
+    {
+        SL_LOG_ERROR("Creating an NGX 2d texture failed: width=%d, height=%d", resDesc.width, resDesc.height);
+        // make sure to return nullptr to the caller.
+        *resource = nullptr;
+    }
 }
 
 void allocateNGXResourceCallback(D3D12_RESOURCE_DESC* desc, int state, CD3DX12_HEAP_PROPERTIES* heap, ID3D12Resource** resource)
@@ -873,18 +1151,31 @@ void allocateNGXResourceCallback(D3D12_RESOURCE_DESC* desc, int state, CD3DX12_H
 
     auto compute = ctx.computeD3D12 ? ctx.computeD3D12 : ctx.compute;
 
+    sl::chi::ComputeStatus status;
+    std::string resourceName{};
     //! Redirecting to host app if allocate callback is specified in sl::Preferences
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION::D3D12_RESOURCE_DIMENSION_BUFFER)
     {
-        compute->createBuffer(resDesc, res);
+        resourceName = SL_COMPOSE_NAME("sl", "buf.resource");
+        status = compute->createBuffer(resDesc, res, resourceName.c_str());
     }
     else
     {
-        compute->createTexture2D(resDesc, res);
+        resourceName = SL_COMPOSE_NAME("sl", "tex2d.resource");
+        status = compute->createTexture2D(resDesc, res, resourceName.c_str());
     }
-
-    *resource = (ID3D12Resource*)(res->native);
-    delete res;
+    if (status == sl::chi::ComputeStatus::eOk)
+    {
+        SL_LOG_VERBOSE("Allocated NGX resource '%s'", resourceName.c_str());
+        *resource = (ID3D12Resource*)(res->native);
+        delete res;
+    }
+    else
+    {
+        SL_LOG_ERROR("Creating an NGX resource failed: width=%d, height=%d", resDesc.width, resDesc.height);
+        // make sure to return nullptr to the caller.
+        *resource = nullptr;
+    }
 }
 
 //! Managing deallocations coming from NGX
@@ -911,7 +1202,11 @@ void releaseNGXResourceCallback(IUnknown* resource)
         {
             ID3D11Resource* d3d11Resource{};
             resource->QueryInterface(&d3d11Resource);
-            if (!d3d11Resource)
+            if (d3d11Resource)
+            {
+                d3d11Resource->Release();
+            }
+            else
             {
                 res->type = ResourceType::eUnknown;
             }
@@ -920,51 +1215,35 @@ void releaseNGXResourceCallback(IUnknown* resource)
     }
 }
 
+std::string getNGXFeatureAsStr(NVSDK_NGX_Feature feature)
+{
+    switch (feature)
+    {
+        case NVSDK_NGX_Feature_SuperSampling:        return "SuperSampling";
+        case NVSDK_NGX_Feature_InPainting:           return "InPainting";
+        case NVSDK_NGX_Feature_ImageSuperResolution: return "ImageSuperResolution";
+        case NVSDK_NGX_Feature_SlowMotion:           return "SlowMotion";
+        case NVSDK_NGX_Feature_VideoSuperResolution: return "VideoSuperResolution";
+        case NVSDK_NGX_Feature_ImageSignalProcessing:return "ImageSignalProcessing";
+        case NVSDK_NGX_Feature_DeepResolve:          return "DeepResolve";
+        case NVSDK_NGX_Feature_FrameGeneration:      return "FrameGeneration";
+        case NVSDK_NGX_Feature_DeepDVC:              return "DeepDVC";
+        case NVSDK_NGX_Feature_RayReconstruction:    return "RayReconstruction";
+        default:                                     return "Unknown(" + std::to_string(static_cast<int>(feature)) + ")";
+    }
+}
+
 void ngxLog(const char* message, NVSDK_NGX_Logging_Level loggingLevel, NVSDK_NGX_Feature sourceComponent)
 {
+    std::string sFeatureName = getNGXFeatureAsStr(sourceComponent);
     switch (loggingLevel)
     {
-        case NVSDK_NGX_LOGGING_LEVEL_ON: SL_LOG_INFO(message); break;
-        case NVSDK_NGX_LOGGING_LEVEL_VERBOSE: SL_LOG_VERBOSE(message); break;
+        case NVSDK_NGX_LOGGING_LEVEL_ON:      SL_LOG_INFO("[%s] %s", sFeatureName.c_str(), message); break;
+        case NVSDK_NGX_LOGGING_LEVEL_VERBOSE:  SL_LOG_VERBOSE("[%s] %s", sFeatureName.c_str(), message); break;
     }
 };
 
 } // namespace ngx
-
-bool getStringFromModule(const char* moduleName, const char* stringName, std::string& value)
-{
-    TCHAR filename[MAX_PATH + 1]{};
-    //if (GetModuleFileName(GetModuleHandle(moduleName), filename, MAX_PATH) == 0)
-    {
-        wchar_t* slPluginPathUtf16{};
-        param::getPointerParam(api::getContext()->parameters, param::global::kPluginPath, &slPluginPathUtf16);
-        if (!slPluginPathUtf16) return false;
-        std::string path = extra::utf16ToUtf8(slPluginPathUtf16) + std::string("\\") + moduleName;
-        strcpy_s(filename, MAX_PATH + 1, path.c_str());
-    }
-
-    DWORD dummy;
-    auto size = GetFileVersionInfoSize(filename, &dummy);
-    if (size == 0)
-    {
-        return false;
-    }
-    std::vector<BYTE> data(size);
-
-    if (!GetFileVersionInfo(filename, NULL, size, &data[0]))
-    {
-        return false;
-    }
-
-    LPVOID stringValue = NULL;
-    uint32_t stringValueLen = 0;
-    if (!VerQueryValueA(&data[0], (std::string("\\StringFileInfo\\040904e4\\") + stringName).c_str(), &stringValue, &stringValueLen))
-    {
-        return false;
-    }
-    value = (const char*)stringValue;
-    return true;
-}
 
 //! Common JSON configuration containing OS version, driver version, GPU architecture, supported adapters, plugin's SHA etc.
 //! 
@@ -1080,7 +1359,7 @@ Result pclGetData(const BaseStructure*, BaseStructure* outputs, CommandBuffer*)
 bool slOnPluginStartup(const char* jsonConfig, void* device)
 {
     SL_PLUGIN_COMMON_STARTUP();
-    
+
     auto& ctx = (*common::getContext());
 
     auto parameters = api::getContext()->parameters;
@@ -1089,9 +1368,12 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     parameters->set(param::global::kPFunGetConsts, getCommonConstants);
     parameters->set(param::global::kPFunGetTag, getCommonTag);
     parameters->set(param::common::kPFunRegisterEvaluateCallbacks, common::registerEvaluateCallbacks);
+    parameters->set(param::common::kPFunRegisterFeatureViewport, registerCommonFeatureViewport);
+    parameters->set(param::common::kPFunUnregisterFeatureViewport, unregisterCommonFeatureViewport);
 
     //! Plugin manager gives us the device type and the application id
     json& config = *(json*)api::getContext()->loaderConfig;
+
     auto deviceType = RenderAPI::eD3D12;
     int appId = 0;
     config.at("appId").get_to(appId);
@@ -1145,7 +1427,7 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     ctx.compute = compute;
     ctx.computeD3D12 = computeD3D12;
 
-    CHI_CHECK_RF(ctx.compute->createResourcePool(&ctx.pool, api::getContext()->pluginName.c_str()));
+    CHI_CHECK_RF(ctx.compute->createResourcePool(&ctx.pool, api::getPluginName()));
 
     // Allow lower level common interface to read config items etc.
     if (!common::onLoad(&config, &extraConfig, ctx.pool))
@@ -1153,17 +1435,6 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
         return false;
     }
 
-#ifdef SL_CAPTURE
-    if (extraConfig.contains("numberFrameCapture"))
-    {
-        int captIndex;
-        extraConfig.at("numberFrameCapture").get_to(captIndex);
-        sl::chi::ICapture* capture;
-        param::getPointerParam(api::getContext()->parameters, sl::param::common::kCaptureAPI, &capture);
-        capture->setMaxCaptureIndex(captIndex);
-    }
-#endif
-    
     if (ctx.needNGX)
     {
         // NGX initialization
@@ -1172,18 +1443,17 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
         // Reset our flag until we see if NGX can be initialized correctly
         ctx.needNGX = false;
 
-        // We also need to provide path for logging
-        PWSTR documentsDataPath = (PWSTR)file::getTmpPath();
-        if (!documentsDataPath)
+        // Directory for NGX logs and other temporary files
+        wchar_t* slPluginPathUtf16 = {};
+        param::getPointerParam(parameters, param::global::kPluginPath, &slPluginPathUtf16);
+        if (!slPluginPathUtf16 || !*slPluginPathUtf16)
         {
-            SL_LOG_ERROR( "Failed to obtain path to documents");
+            SL_LOG_ERROR("Failed to obtain path for NGX application data");
         }
 
         // We need to provide path to the NGX modules
-        wchar_t* slPluginPathUtf16 = {};
-        param::getPointerParam(parameters, param::global::kPluginPath, &slPluginPathUtf16);
         // Always check first where our plugins are then the other paths
-        std::vector<std::wstring> ngxPathsTmp = {slPluginPathUtf16 };
+        std::vector<std::wstring> ngxPathsTmp = { slPluginPathUtf16 };
         std::vector<wchar_t*> ngxPaths = { slPluginPathUtf16 };
         auto& paths = config.at("paths");
         for (auto& p : paths)
@@ -1221,32 +1491,33 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
 
         NVSDK_NGX_Result ngxStatus{};
         
-        if (!engineVersion.empty() && !projectId.empty())
+        bool hasProjectId = !engineVersion.empty() && !projectId.empty();
+        if (hasProjectId)
         {
             // Engine data provided, no need for the application id
             if (deviceType == RenderAPI::eD3D11)
             {
-                ngxStatus = NVSDK_NGX_D3D11_Init_with_ProjectID(projectId.c_str(), (NVSDK_NGX_EngineType)engine, engineVersion.c_str(), documentsDataPath, (ID3D11Device*)device, &info, NVSDK_NGX_Version_API);
+                ngxStatus = NVSDK_NGX_D3D11_Init_with_ProjectID(projectId.c_str(), (NVSDK_NGX_EngineType)engine, engineVersion.c_str(), slPluginPathUtf16, (ID3D11Device*)device, &info, NVSDK_NGX_Version_API);
                 ngxStatus = NVSDK_NGX_D3D11_GetCapabilityParameters(&ctx.ngxContext.params);
 
                 if (ctx.computeD3D12)
                 {
                     chi::Device deviceD3D12;
                     CHI_CHECK_RF(ctx.computeD3D12->getDevice(deviceD3D12));
-                    ngxStatus = NVSDK_NGX_D3D12_Init_with_ProjectID(projectId.c_str(), (NVSDK_NGX_EngineType)engine, engineVersion.c_str(), documentsDataPath, (ID3D12Device*)deviceD3D12, &info, NVSDK_NGX_Version_API);
+                    ngxStatus = NVSDK_NGX_D3D12_Init_with_ProjectID(projectId.c_str(), (NVSDK_NGX_EngineType)engine, engineVersion.c_str(), slPluginPathUtf16, (ID3D12Device*)deviceD3D12, &info, NVSDK_NGX_Version_API);
                     ngxStatus = NVSDK_NGX_D3D12_GetCapabilityParameters(&ctx.ngxContextD3D12.params);
                 }
             }
             else if (deviceType == RenderAPI::eD3D12)
             {
-                ngxStatus = NVSDK_NGX_D3D12_Init_with_ProjectID(projectId.c_str(), (NVSDK_NGX_EngineType)engine, engineVersion.c_str(), documentsDataPath, (ID3D12Device*)device, &info, NVSDK_NGX_Version_API);
+                ngxStatus = NVSDK_NGX_D3D12_Init_with_ProjectID(projectId.c_str(), (NVSDK_NGX_EngineType)engine, engineVersion.c_str(), slPluginPathUtf16, (ID3D12Device*)device, &info, NVSDK_NGX_Version_API);
                 ngxStatus = NVSDK_NGX_D3D12_GetCapabilityParameters(&ctx.ngxContext.params);
             }
             else
             {
                 VkDevices* slVkDevices = (VkDevices*)device;
 
-                ngxStatus = NVSDK_NGX_VULKAN_Init_with_ProjectID(projectId.c_str(), (NVSDK_NGX_EngineType)engine, engineVersion.c_str(), documentsDataPath, slVkDevices->instance, slVkDevices->physical, slVkDevices->device, nullptr/* TODO TBD plumb in vkGetInstanceProcAddr*/, nullptr/* TODO TBD plumb in vkGetDeviceProcAddr*/, &info, NVSDK_NGX_Version_API);
+                ngxStatus = NVSDK_NGX_VULKAN_Init_with_ProjectID(projectId.c_str(), (NVSDK_NGX_EngineType)engine, engineVersion.c_str(), slPluginPathUtf16, slVkDevices->instance, slVkDevices->physical, slVkDevices->device, nullptr/* TODO TBD plumb in vkGetInstanceProcAddr*/, nullptr/* TODO TBD plumb in vkGetDeviceProcAddr*/, &info, NVSDK_NGX_Version_API);
                 ngxStatus = NVSDK_NGX_VULKAN_GetCapabilityParameters(&ctx.ngxContext.params);
             }
         }
@@ -1266,38 +1537,38 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
 #endif
             if (deviceType == RenderAPI::eD3D11)
             {
-                ngxStatus = NVSDK_NGX_D3D11_Init(appId, documentsDataPath, (ID3D11Device*)device, &info, NVSDK_NGX_Version_API);
+                ngxStatus = NVSDK_NGX_D3D11_Init(appId, slPluginPathUtf16, (ID3D11Device*)device, &info, NVSDK_NGX_Version_API);
                 ngxStatus = NVSDK_NGX_D3D11_GetCapabilityParameters(&ctx.ngxContext.params);
 
                 if (ctx.computeD3D12)
                 {
                     chi::Device deviceD3D12;
                     CHI_CHECK_RF(ctx.computeD3D12->getDevice(deviceD3D12));
-                    ngxStatus = NVSDK_NGX_D3D12_Init(appId, documentsDataPath, (ID3D12Device*)deviceD3D12, &info, NVSDK_NGX_Version_API);
+                    ngxStatus = NVSDK_NGX_D3D12_Init(appId, slPluginPathUtf16, (ID3D12Device*)deviceD3D12, &info, NVSDK_NGX_Version_API);
                     ngxStatus = NVSDK_NGX_D3D12_GetCapabilityParameters(&ctx.ngxContextD3D12.params);
                 }
             }
             else if (deviceType == RenderAPI::eD3D12)
             {
-                ngxStatus = NVSDK_NGX_D3D12_Init(appId, documentsDataPath, (ID3D12Device*)device, &info, NVSDK_NGX_Version_API);
+                ngxStatus = NVSDK_NGX_D3D12_Init(appId, slPluginPathUtf16, (ID3D12Device*)device, &info, NVSDK_NGX_Version_API);
                 ngxStatus = NVSDK_NGX_D3D12_GetCapabilityParameters(&ctx.ngxContext.params);
             }
             else
             {
                 VkDevices* slVkDevices = (VkDevices*)device;
 
-                ngxStatus = NVSDK_NGX_VULKAN_Init(appId, documentsDataPath, slVkDevices->instance, slVkDevices->physical, slVkDevices->device, nullptr/* TODO TBD plumb in vkGetInstanceProcAddr*/, nullptr/* TODO TBD plumb in vkGetDeviceProcAddr*/, &info, NVSDK_NGX_Version_API);
+                ngxStatus = NVSDK_NGX_VULKAN_Init(appId, slPluginPathUtf16, slVkDevices->instance, slVkDevices->physical, slVkDevices->device, nullptr/* TODO TBD plumb in vkGetInstanceProcAddr*/, nullptr/* TODO TBD plumb in vkGetDeviceProcAddr*/, &info, NVSDK_NGX_Version_API);
                 ngxStatus = NVSDK_NGX_VULKAN_GetCapabilityParameters(&ctx.ngxContext.params);
             }
         }
 
         if (ngxStatus == NVSDK_NGX_Result_Success)
         {
-            SL_LOG_HINT("NGX loaded - app id %u - application data path %S", appId, documentsDataPath);
+            SL_LOG_HINT("NGX loaded - app id %u - application data path %S", appId, slPluginPathUtf16);
 
-            if (appId == kTemporaryAppId)
+            if (!hasProjectId && appId == kTemporaryAppId)
             {
-                SL_LOG_WARN("Valid application id is required in production builds - allowing for now but please fix this");
+                SL_LOG_WARN("Production builds require a valid application ID or project ID. Please provide one of these to ensure proper operation in production.");
             }
 
             ctx.needNGX = true;
@@ -1368,6 +1639,8 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
             ctx.drsContext.drsReadKeyFromProfile = drs::drsReadKeyFromProfile;
             ctx.drsContext.drsReadKeyString = drs::drsReadKeyString;
             ctx.drsContext.drsReadKeyStringFromProfile = drs::drsReadKeyStringFromProfile;
+            ctx.drsContext.drsReadKeyFromProfileNoGlobal = drs::drsReadKeyFromProfileNoGlobal;
+            ctx.drsContext.drsReadKeyStringFromProfileNoGlobal = drs::drsReadKeyStringFromProfileNoGlobal;
             parameters->set(param::global::kDRSContext, &ctx.drsContext);
         }
         else
@@ -1388,6 +1661,19 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
         sl::pcl::implOnPluginStartup(parameters, &pclGetData, &pclSetData);
     }
 
+    PreferenceFlags preferenceFlags{};
+    api::getContext()->parameters->get(sl::param::global::kPreferenceFlags, (uint64_t*)&preferenceFlags);
+
+    ctx.useResourceTaggingForFrame = ((preferenceFlags & PreferenceFlags::eUseFrameBasedResourceTagging) != 0);
+    if (ctx.useResourceTaggingForFrame)
+    {
+        ctx.pBaseResourceTagging = std::make_unique<common::ResourceTaggingForFrame>(ctx.compute, ctx.pool);
+    }
+    else
+    {
+        ctx.pBaseResourceTagging = std::make_unique<common::ResourceTaggingGeneral>();
+    }
+
     return true;
 }
 
@@ -1396,11 +1682,14 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
 void slOnPluginShutdown()
 {
     auto parameters = api::getContext()->parameters;
+    auto& ctx = (*common::getContext());
 
     // Remove all provided common interfaces
     parameters->set(param::global::kPFunGetConsts, nullptr);
     parameters->set(param::global::kPFunGetTag, nullptr);
     parameters->set(param::common::kPFunRegisterEvaluateCallbacks, nullptr);
+    parameters->set(param::common::kPFunRegisterFeatureViewport, nullptr);
+    parameters->set(param::common::kPFunUnregisterFeatureViewport, nullptr);
     parameters->set(param::common::kPFunGetStringFromModule, nullptr);
     parameters->set(param::common::kPFunUpdateCommonEmbeddedJSONConfig, nullptr);
     parameters->set(param::common::kPFunNGXGetFeatureRequirements, nullptr);
@@ -1409,7 +1698,16 @@ void slOnPluginShutdown()
     parameters->set(param::common::kKeyboardAPI, nullptr);
     parameters->set(param::common::kComputeAPI, nullptr);
 
-    auto& ctx = (*common::getContext());
+    {
+        std::lock_guard<std::mutex> lock(ctx.featureViewportIdsMutex);
+        ctx.featureViewportIds.clear();
+    }
+
+    if (ctx.pBaseResourceTagging != nullptr)
+    {
+        ctx.pBaseResourceTagging.reset(nullptr);
+    }
+
 
     if (ctx.enablePCLPluginInCommonWAR)
     {
@@ -1425,7 +1723,6 @@ void slOnPluginShutdown()
         if(adapter) adapter->Release();
     }
 
-    ctx.idToResourceMap.clear();
 
     if (ctx.needNGX)
     {
@@ -1689,12 +1986,16 @@ SL_EXPORT void* slGetPluginFunction(const char* functionName)
     SL_EXPORT_FUNCTION(slOnPluginShutdown);
     SL_EXPORT_FUNCTION(slOnPluginStartup);
     SL_EXPORT_FUNCTION(slSetTag);
+    SL_EXPORT_FUNCTION(slSetTagForFrame);
     SL_EXPORT_FUNCTION(slSetConstants);
     SL_EXPORT_FUNCTION(slEvaluateFeature)
 
     //! Hooks defined in the JSON config above
 
     //! D3D12
+    SL_EXPORT_FUNCTION(slHookCreateSwapChain);
+    SL_EXPORT_FUNCTION(slHookCreateSwapChainForHwnd);
+    SL_EXPORT_FUNCTION(slHookCreateSwapChainForCoreWindow);
     SL_EXPORT_FUNCTION(slHookPresent);
     SL_EXPORT_FUNCTION(slHookPresent1);
     SL_EXPORT_FUNCTION(slHookAfterPresent);

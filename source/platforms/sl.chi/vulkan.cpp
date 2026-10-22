@@ -23,18 +23,28 @@
 #include "source/core/sl.log/log.h"
 #include "source/platforms/sl.chi/vulkan.h"
 #include "source/core/sl.param/parameters.h"
-#include "source/core/sl.security/secureLoadLibrary.h"
 #include "shaders/vulkan_clear_image_view_spirv.h"
 #include "nvllvk.h"
 #include "external/vulkan/include/vulkan/vulkan_win32.h"
 
-// Errors are negative so don't check for VK_SUCCESS only since there are other 'non fatal' values > 0, we show them as warnings
-#define VK_CHECK(f) {auto _r = f;if(_r < 0){SL_LOG_ERROR("%s failed - error %d",#f,_r); return ComputeStatus::eError;} else if(_r != 0) {SL_LOG_WARN("%s - warning %d",#f,_r);}}
-#define VK_CHECK_RV(f) {auto _r = f;if(_r < 0){SL_LOG_ERROR("%s failed - error %d",#f,_r); return;} else if(_r != 0) {SL_LOG_WARN("%s - warning %d",#f,_r);}}
-#define VK_CHECK_RF(f) {auto _r = f;if(_r < 0){SL_LOG_ERROR("%s failed - error %d",#f,_r); return false;} else if(_r != 0) {SL_LOG_WARN("%s - warning %d",#f,_r);}}
-#define VK_CHECK_RN(f) {auto _r = f;if(_r < 0){SL_LOG_ERROR("%s failed - error %d",#f,_r); return nullptr;} else if(_r != 0) {SL_LOG_WARN("%s - warning %d",#f,_r);}}
-#define VK_CHECK_RE(res, f) res = f;if(res < 0){SL_LOG_ERROR("%s failed - error %d",#f,res); return res;} else if(res != 0) {SL_LOG_WARN("%s - warning %d",#f,res);}
-#define VK_CHECK_RWS(f) {auto _r = f;if(_r < 0){SL_LOG_ERROR("%s failed - error %d",#f,_r); return WaitStatus::eError;} else if(_r == VK_TIMEOUT) {SL_LOG_WARN("%s - timed out", #f); return WaitStatus::eTimeout;}}
+#include "external/nsight-sdk/SystemsGraphics/include/NGFX_Vulkan.h"
+#include "external/nsight-sdk/SystemsGraphics/include/NGFX_GraphicsCapture_Vulkan.h"
+#include "external/nsight-sdk/SystemsGraphics/include/NGFX_GPUTrace_Vulkan.h"
+#include "external/nsight-sdk/SystemsGraphics/include/NGFX_SystemProfiling_Vulkan.h"
+
+// Swap chain private data requires Vulkan 1.3 (VkPrivateDataSlot, VK_OBJECT_TYPE_SWAPCHAIN_KHR, vkSet/GetPrivateData).
+#if !defined(VK_VERSION_1_3)
+#error "Vulkan SDK 1.3+ headers required for swap chain private data support"
+#endif
+
+inline constexpr auto ngfxFrameBoundaryType(bool isGenerated, bool isBegin)
+{
+    return isGenerated
+        ? (isBegin ? NGFX_For_Dlss_DLSS_FG_PresentBoundaryType_Generated_Frame_Begin : NGFX_For_Dlss_DLSS_FG_PresentBoundaryType_Generated_Frame_End)
+        : (isBegin ? NGFX_For_Dlss_DLSS_FG_PresentBoundaryType_Real_Frame_Begin : NGFX_For_Dlss_DLSS_FG_PresentBoundaryType_Real_Frame_End);
+}
+
+// VK_CHECK_* macros now live in source/platforms/sl.chi/vulkan.h so vknvll2.cpp can use them too.
 
 #define CHECK_REFLEX() do { if (!m_reflex){ SL_LOG_WARN_ONCE("No reflex"); return ComputeStatus::eError; } } while(false)
 
@@ -67,6 +77,131 @@ void KernelDataVK::destroy(const VkLayerDispatchTable& ddt, VkDevice device)
     shaderModule = VK_NULL_HANDLE;
 }
 
+struct Allocator
+{
+    void init(VkCommandPool pAllocator, VkLayerDispatchTable* pDdt, ICompute* pCompute, VkDevice pDevice, std::string sDebugName)
+    {
+        destroy();
+
+        m_pAllocator = pAllocator;
+        m_pDdt = pDdt;
+        m_pCompute = pCompute;
+        m_pDevice = pDevice;
+        m_sDebugName = sDebugName;
+
+        // at all times we want to have at least one command buffer - because we have getCommandBuffer() function
+        TimedCommandBuffer cmdBuffer;
+        cmdBuffer.m_pBuffer = allocateNewCmdBuffer();
+        m_pCmdBuffers.push_back(cmdBuffer);
+    }
+
+    ~Allocator()
+    {
+        destroy();
+    }
+
+    void destroy()
+    {
+        for (uint32_t u = 0; u < m_pCmdBuffers.size(); ++u)
+        {
+            freeCmdBuffer(m_pCmdBuffers[u].m_pBuffer);
+        }
+        m_pCmdBuffers.resize(0);
+        if (m_pAllocator)
+        {
+            m_pDdt->DestroyCommandPool(m_pDevice, m_pAllocator, nullptr);
+        }
+        m_pAllocator = nullptr;
+        m_pDdt = nullptr;
+        m_pCompute = nullptr;
+        m_pDevice = nullptr;
+        m_sDebugName.clear();
+    }
+
+    VkCommandPool getCmdAllocator()
+    {
+        return m_pAllocator;
+    }
+
+    VkCommandBuffer &getLatestCommandBuffer()
+    {
+        return m_pCmdBuffers.rbegin()->m_pBuffer;
+    }
+
+    VkCommandBuffer beginCommandList(uint64_t signalledFenceValue, uint64_t completedFenceValue)
+    {
+        assert(m_pCmdBuffers.size() < 20); // why would we have some many command buffers? something seems wrong
+        // The command buffers are sorted according to the fence value.
+        // Find how many command buffers have already executed on the GPU
+        uint32_t nOldCommandLists = 0;
+        for ( ; ; ++nOldCommandLists)
+        {
+            if (nOldCommandLists >= m_pCmdBuffers.size())
+                break;
+            if (m_pCmdBuffers[nOldCommandLists].isInUse(completedFenceValue))
+            {
+                break;
+            }
+        }
+        TimedCommandBuffer cmdBuffer;
+        if (nOldCommandLists > 0)
+        {
+            for (uint32_t u = 1; u < nOldCommandLists; ++u) // free all buffers except one
+            {
+                freeCmdBuffer(m_pCmdBuffers[u].m_pBuffer);
+            }
+            cmdBuffer = m_pCmdBuffers[0];
+            m_pCmdBuffers.erase(m_pCmdBuffers.begin(), m_pCmdBuffers.begin() + nOldCommandLists);
+        }
+        else
+        {
+            cmdBuffer.m_pBuffer = allocateNewCmdBuffer();
+        }
+        cmdBuffer.m_fenceValueWhenFree = signalledFenceValue + 1;
+        m_pCmdBuffers.push_back(cmdBuffer);
+        return cmdBuffer.m_pBuffer;
+    }
+
+  private:
+    struct TimedCommandBuffer
+    {
+        bool isInUse(uint64_t completedFenceValue)
+        {
+            return completedFenceValue < m_fenceValueWhenFree;
+        }
+        VkCommandBuffer m_pBuffer = nullptr;
+        uint64_t m_fenceValueWhenFree = 0;
+    };
+
+    VkCommandBuffer allocateNewCmdBuffer()
+    {
+        const VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                                       nullptr,
+                                                       m_pAllocator,
+                                                       VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                                       1};
+        VkCommandBuffer cmdBuffer;
+        VK_CHECK_RN(m_pDdt->AllocateCommandBuffers(m_pDevice, &allocInfo, &cmdBuffer));
+        sl::Resource r;
+        r.native = cmdBuffer;
+        r.type = (ResourceType)ResourceType::eCommandBuffer;
+        m_pCompute->setDebugName(&r, (m_sDebugName + ".command-buffer").c_str());
+        return cmdBuffer;
+    }
+    void freeCmdBuffer(VkCommandBuffer cmdBuffer)
+    {
+        m_pDdt->FreeCommandBuffers(m_pDevice, m_pAllocator, 1, &cmdBuffer);
+    }
+
+    std::vector<TimedCommandBuffer> m_pCmdBuffers;
+
+    VkCommandPool m_pAllocator = nullptr;
+    VkLayerDispatchTable* m_pDdt = nullptr;
+    ICompute* m_pCompute = nullptr;
+    VkDevice m_pDevice = nullptr;
+    std::string m_sDebugName;
+};
+
 class CommandListContextVK : public ICommandListContext
 {
     struct WaitInfo
@@ -79,14 +214,19 @@ class CommandListContextVK : public ICommandListContext
     VkLayerDispatchTable m_ddt;
     interposer::VkTable* m_vk;
 
+    // Submit SL's own work via vkQueueSubmit2 when synchronization2 is enabled on the device (and the
+    // entry point resolved); otherwise fall back to the v1 vkQueueSubmit. Calling vkQueueSubmit2 without
+    // synchronization2 enabled is a spec violation, so both conditions must hold. Set in init().
+    bool m_useSync2 = false;
+
     ICompute* m_compute = {};
     VkQueue m_cmdQueue;
     VkSemaphore m_presentSemaphore{};
     std::vector<VkSemaphore> m_acquireSemaphore{};  // binary semaphore correspondng to each swapchain buffer passed to swapchain-acquisition VK API.
     std::vector<VkFence> m_acquireFence{}; // Host-side (CPU) fence correspondng to each swapchain buffer passed to swapchain-acquisition to be able to do CPU wait.
     uint32_t m_acquireIndex{}; // indexes into m_acquireSemaphore and m_acquireFence list.
-    std::vector<VkCommandBuffer> m_cmdBuffer;
-    std::vector<VkCommandPool> m_allocator;
+
+    std::vector<Allocator> m_allocators;
     std::vector<VkSemaphore> m_fence;
     std::vector<uint64_t> m_fenceValue = {};
     bool m_cmdListIsRecording = false;
@@ -99,28 +239,34 @@ class CommandListContextVK : public ICommandListContext
     std::mutex m_mtxQueueList;
     std::mutex m_mtxSyncGPU;
 
+    // Reflex/LL2: app frame id stamped onto this context's work submits via VkLatencySubmissionPresentIdNV
+    // (see setLatencyFrameId / executeCommandList). 0 means "no frame, leave untagged". Written by the
+    // caller's frame thread just before its submits and read on the same thread at submit time; atomic
+    // only to keep it well-defined if a flush ever submits from another thread.
+    std::atomic<uint64_t> m_latencyFrameId{ 0 };
+
     // Keep validation layer happy
     const VkPipelineStageFlags waitDstStageMask[4] = { VK_PIPELINE_STAGE_ALL_COMMANDS_BIT , VK_PIPELINE_STAGE_ALL_COMMANDS_BIT , VK_PIPELINE_STAGE_ALL_COMMANDS_BIT , VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
 
 public:
 
-    void init(ICompute* c, interposer::VkTable* vkMap, const char* debugName, VkDevice dev, CommandQueueVk* queue, uint32_t count)
+    void init(ICompute* c, interposer::VkTable* vkMap, const char* debugName, VkDevice dev, CommandQueueVk* queue, uint32_t count, bool sync2Enabled)
     {
         m_compute = c;
         m_device = dev;
         m_vk = vkMap;
         m_ddt = m_vk->dispatchDeviceMap[dev];
+        m_useSync2 = sync2Enabled && m_ddt.QueueSubmit2 != nullptr;
         m_name = extra::utf8ToUtf16(debugName);
         m_cmdQueue = (VkQueue)queue->native;
         m_bufferCount = count;
         m_acquireSemaphore.resize(m_bufferCount);
         m_acquireFence.resize(m_bufferCount);
         m_acquireIndex = m_bufferCount - 1;
-        m_allocator.resize(m_bufferCount);
+        m_allocators.resize(m_bufferCount);
         m_fence.resize(m_bufferCount);
         m_fenceValue.resize(m_bufferCount);
-        m_cmdBuffer.resize(m_bufferCount);
-    
+
         VkSemaphoreCreateInfo createInfo;
         createInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         createInfo.pNext = {};
@@ -129,7 +275,7 @@ public:
         sl::Resource r{};
         r.type = (ResourceType)ResourceType::eFence;
         r.native = m_presentSemaphore;
-        m_compute->setDebugName(&r, "SL_present_semaphore");
+        m_compute->setDebugName(&r, (std::string(debugName) + ".present-semaphore").c_str());
 
         VkFenceCreateInfo fenceCreateinfo = {};
         fenceCreateinfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -140,18 +286,18 @@ public:
             r.type = (ResourceType)ResourceType::eFence;
             r.native = m_acquireSemaphore[i];
             std::stringstream name{};
-            name << "SL_acquire_semaphore_" << i;
+            name << debugName << ".acquire-semaphore." << i;
             m_compute->setDebugName(&r, name.str().c_str());
 
             VK_CHECK_RV(m_ddt.CreateFence(dev, &fenceCreateinfo, NULL, &m_acquireFence[i]));
             r.type = (ResourceType)ResourceType::eHostFence;
             r.native = m_acquireFence[i];
             name = std::stringstream{};
-            name << "SL_acquire_fence_" << i;
+            name << debugName << ".acquire-fence." << i;
             m_compute->setDebugName(&r, name.str().c_str());
         }
 
-        SL_LOG_INFO("Creating command context %s - cmd buffers %u", debugName, m_bufferCount);
+        SL_LOG_INFO("Creating command context %s - cmd buffers %u - submit path %s", debugName, m_bufferCount, m_useSync2 ? "vkQueueSubmit2" : "vkQueueSubmit");
 
         for (uint32_t i = 0; i < m_bufferCount; i++)
         {
@@ -174,28 +320,19 @@ public:
                 sl::Resource r;
                 r.native = m_fence[i];
                 r.type = (ResourceType)ResourceType::eFence;
-                m_compute->setDebugName(&r, (std::string(debugName) + "_semaphore").c_str());
+                m_compute->setDebugName(&r, (std::string(debugName) + ".semaphore").c_str());
             }
             {
+                VkCommandPool allocator{};
                 const VkCommandPoolCreateInfo createInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, queue->family };
-                VK_CHECK_RV(m_ddt.CreateCommandPool(m_device, &createInfo, nullptr, &m_allocator[i]));
+                VK_CHECK_RV(m_ddt.CreateCommandPool(m_device, &createInfo, nullptr, &allocator));
                 sl::Resource r;
-                r.native = m_allocator[i];
+                r.native = allocator;
                 r.type = (ResourceType)ResourceType::eCommandPool;
-                m_compute->setDebugName(&r, (std::string(debugName) + "_command_pool").c_str());
+                m_compute->setDebugName(&r, (std::string(debugName) + ".command-pool").c_str());
+                m_allocators[i].init(allocator, &m_ddt, m_compute, m_device, debugName);
             }
-            {
-                const VkCommandBufferAllocateInfo allocInfo =
-                {
-                    VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr,
-                    m_allocator[i], VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1
-                };
-                VK_CHECK_RV(m_ddt.AllocateCommandBuffers(m_device, &allocInfo, &m_cmdBuffer[i]));
-                sl::Resource r;
-                r.native = m_cmdBuffer[i];
-                r.type = (ResourceType)ResourceType::eCommandBuffer;
-                m_compute->setDebugName(&r, (std::string(debugName) + "_command_buffer").c_str());
-            }
+
         }
         
     }
@@ -206,8 +343,7 @@ public:
 
         for (uint32_t i = 0; i < m_bufferCount; i++)
         {
-            m_ddt.FreeCommandBuffers(m_device, m_allocator[i], 1, &m_cmdBuffer[i]);
-            m_ddt.DestroyCommandPool(m_device, m_allocator[i], nullptr);
+            m_allocators[i].destroy();
             m_ddt.DestroySemaphore(m_device, m_fence[i], nullptr);
             m_ddt.DestroyFence(m_device, m_acquireFence[i], NULL);
             m_ddt.DestroySemaphore(m_device, m_acquireSemaphore[i], nullptr);
@@ -215,10 +351,9 @@ public:
 
         m_ddt.DestroySemaphore(m_device, m_presentSemaphore, nullptr);
 
-        m_cmdBuffer.clear();
         m_fenceValue.clear();
         m_fence.clear();
-        m_allocator.clear();
+        m_allocators.clear();
         m_acquireFence.clear();
         m_acquireSemaphore.clear();
     }
@@ -227,7 +362,7 @@ public:
 
     CommandList getCmdList()
     {
-        return m_cmdBuffer[m_index];
+        return m_allocators[m_index].getLatestCommandBuffer();
     }
 
     CommandQueue getCmdQueue()
@@ -235,9 +370,19 @@ public:
         return m_cmdQueue;
     }
 
+    void setLatencyFrameId(uint64_t frameId) override
+    {
+        // Ignore 0 ("no frame"): keep the last real frame id so a frame-less present still rides the
+        // most recent attribution rather than going untagged. executeCommandList chains it per submit.
+        if (frameId != 0)
+        {
+            m_latencyFrameId.store(frameId, std::memory_order_relaxed);
+        }
+    }
+
     CommandAllocator getCmdAllocator()
     {
-        return m_allocator[m_index];
+        return m_allocators[m_index].getCmdAllocator();
     }
 
     Handle getFenceEvent()
@@ -260,19 +405,10 @@ public:
         auto idx = m_index;
         auto syncValue = m_fenceValue[m_index];
         
-        uint64_t completedValue;
-        VK_CHECK_RF(m_ddt.GetSemaphoreCounterValue(m_device, m_fence[idx], &completedValue));
-        if (completedValue < syncValue)
-        {
-            VkSemaphoreWaitInfo waitInfo;
-            waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-            waitInfo.pNext = NULL;
-            waitInfo.flags = 0;
-            waitInfo.semaphoreCount = 1;
-            waitInfo.pSemaphores = &m_fence[idx];
-            waitInfo.pValues = &syncValue;
-            VK_CHECK_RF(m_ddt.WaitSemaphores(m_device, &waitInfo, kMaxSemaphoreWaitUs));
-        }
+        uint64_t signalledFenceValue = m_fenceValue[idx];
+        uint64_t completedFenceValue;
+        VK_CHECK_RF(m_ddt.GetSemaphoreCounterValue(m_device, m_fence[idx], &completedFenceValue));
+        VkCommandBuffer cmdBuffer = m_allocators[idx].beginCommandList(signalledFenceValue, completedFenceValue);
 
         // One time usage since we wait for the last workload to finish
         const VkCommandBufferBeginInfo info =
@@ -280,9 +416,72 @@ public:
             VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
             VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr
         };
-        m_cmdListIsRecording = VK_SUCCESS == m_ddt.BeginCommandBuffer(m_cmdBuffer[idx], &info);
+        m_cmdListIsRecording = VK_SUCCESS == m_ddt.BeginCommandBuffer(cmdBuffer, &info);
 
         return m_cmdListIsRecording;
+    }
+
+    // Submit SL's own work to m_cmdQueue, choosing vkQueueSubmit2 (when m_useSync2) or the v1
+    // vkQueueSubmit. Timeline wait/signal values align by index with waitSemaphores/signalSemaphores.
+    // cmdBuffer may be VK_NULL_HANDLE (no command buffer). latencyInfo, when non-null, carries the
+    // Reflex/LL2 frame-attribution chain - on Sync2 it chains onto VkSubmitInfo2, on v1 onto the
+    // timeline submit info; both reach the driver identically. Returns the raw VkResult so callers
+    // keep their existing VK_CHECK_* return semantics.
+    VkResult submitToQueue(VkCommandBuffer cmdBuffer,
+        const std::vector<chi::Fence>& waitSemaphores, const std::vector<uint64_t>& waitValues,
+        const std::vector<chi::Fence>& signalSemaphores, const std::vector<uint64_t>& signalValues,
+        const VkLatencySubmissionPresentIdNV* latencyInfo, VkFence fence)
+    {
+        if (m_useSync2)
+        {
+            std::vector<VkSemaphoreSubmitInfo> waitInfos(waitSemaphores.size());
+            for (size_t i = 0; i < waitSemaphores.size(); i++)
+            {
+                waitInfos[i] = { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+                waitInfos[i].semaphore = (VkSemaphore)waitSemaphores[i];
+                waitInfos[i].value = i < waitValues.size() ? waitValues[i] : 0; // ignored for binary semaphores
+                waitInfos[i].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            }
+            std::vector<VkSemaphoreSubmitInfo> signalInfos(signalSemaphores.size());
+            for (size_t i = 0; i < signalSemaphores.size(); i++)
+            {
+                signalInfos[i] = { VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+                signalInfos[i].semaphore = (VkSemaphore)signalSemaphores[i];
+                signalInfos[i].value = i < signalValues.size() ? signalValues[i] : 0; // ignored for binary semaphores
+                signalInfos[i].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            }
+            VkCommandBufferSubmitInfo cmdInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+            cmdInfo.commandBuffer = cmdBuffer;
+
+            VkSubmitInfo2 submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+            submitInfo.pNext = latencyInfo;
+            submitInfo.waitSemaphoreInfoCount = (uint32_t)waitInfos.size();
+            submitInfo.pWaitSemaphoreInfos = waitInfos.data();
+            submitInfo.commandBufferInfoCount = cmdBuffer != VK_NULL_HANDLE ? 1u : 0u;
+            submitInfo.pCommandBufferInfos = cmdBuffer != VK_NULL_HANDLE ? &cmdInfo : nullptr;
+            submitInfo.signalSemaphoreInfoCount = (uint32_t)signalInfos.size();
+            submitInfo.pSignalSemaphoreInfos = signalInfos.data();
+            return m_ddt.QueueSubmit2(m_cmdQueue, 1, &submitInfo, fence);
+        }
+
+        VkTimelineSemaphoreSubmitInfo timelineInfo = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+        timelineInfo.pNext = latencyInfo;
+        timelineInfo.waitSemaphoreValueCount = (uint32_t)waitValues.size();
+        timelineInfo.pWaitSemaphoreValues = waitValues.data();
+        timelineInfo.signalSemaphoreValueCount = (uint32_t)signalValues.size();
+        timelineInfo.pSignalSemaphoreValues = signalValues.data();
+
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.pNext = &timelineInfo;
+        submitInfo.waitSemaphoreCount = (uint32_t)waitSemaphores.size();
+        submitInfo.pWaitSemaphores = (VkSemaphore*)waitSemaphores.data();
+        submitInfo.signalSemaphoreCount = (uint32_t)signalSemaphores.size();
+        submitInfo.pSignalSemaphores = (VkSemaphore*)signalSemaphores.data();
+        submitInfo.commandBufferCount = cmdBuffer != VK_NULL_HANDLE ? 1u : 0u;
+        submitInfo.pCommandBuffers = cmdBuffer != VK_NULL_HANDLE ? &cmdBuffer : nullptr;
+        submitInfo.pWaitDstStageMask = waitDstStageMask;
+        return m_ddt.QueueSubmit(m_cmdQueue, 1, &submitInfo, fence);
     }
 
     bool executeCommandList(const GPUSyncInfo* info)
@@ -295,7 +494,8 @@ public:
         // Helps with crash dumps if we lose device below by allowing correct execution of the begin/end command buffer logic
         m_cmdListIsRecording = false;
 
-        VK_CHECK_RF(m_ddt.EndCommandBuffer(m_cmdBuffer[m_index]));
+        VkCommandBuffer cmdBuffer = m_allocators[m_index].getLatestCommandBuffer();
+        VK_CHECK_RF(m_ddt.EndCommandBuffer(cmdBuffer));
 
         auto idx = m_index;
         uint64_t syncValue = m_fenceValue[m_index] + 1;
@@ -320,25 +520,26 @@ public:
             }
         }
 
-        VkTimelineSemaphoreSubmitInfo timelineInfo;
-        timelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-        timelineInfo.pNext = NULL;
-        timelineInfo.waitSemaphoreValueCount = (uint32_t)waitValues.size();
-        timelineInfo.pWaitSemaphoreValues = waitValues.data();
-        timelineInfo.signalSemaphoreValueCount = (uint32_t)signalValues.size();
-        timelineInfo.pSignalSemaphoreValues = signalValues.data();
+        // Reflex/LL2 explicit frame attribution: when SL tags, chain VkLatencySubmissionPresentIdNV
+        // onto THIS submit so its frame id is unambiguous. Tagging the work submit directly - rather
+        // than relying on the driver's "reuse last non-zero presentID on this queue" rule - removes
+        // the race where another submitter (e.g. the app sharing this queue) changes the queue's last
+        // id between our tag and our real submit. Frame id 0 means "no frame" and stays untagged.
+        // This path is currently dormant: areLatencyIdsEnabled() always returns false (see
+        // ICompute::areLatencyIdsEnabled), so SL never tags until app-tagging detection exists.
+        VkLatencySubmissionPresentIdNV latencyInfo{};
+        const VkLatencySubmissionPresentIdNV* pLatencyInfo = nullptr;
+        const uint64_t latencyFrameId = m_latencyFrameId.load(std::memory_order_relaxed);
+        if (latencyFrameId != 0 && m_compute->areLatencyIdsSupported() && m_compute->areLatencyIdsEnabled())
+        {
+            latencyInfo.sType = VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV;
+            latencyInfo.pNext = nullptr;
+            latencyInfo.presentID = latencyFrameId;
+            pLatencyInfo = &latencyInfo;
+        }
 
-        VkSubmitInfo submitInfo = {};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.pNext = &timelineInfo;
-        submitInfo.waitSemaphoreCount = (uint32_t)waitSemaphores.size();
-        submitInfo.pWaitSemaphores = (VkSemaphore*)waitSemaphores.data();
-        submitInfo.signalSemaphoreCount = (uint32_t)signalSemaphores.size();
-        submitInfo.pSignalSemaphores = (VkSemaphore*)signalSemaphores.data();
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &m_cmdBuffer[idx];
-        submitInfo.pWaitDstStageMask = waitDstStageMask;
-        VK_CHECK_RF(m_ddt.QueueSubmit(m_cmdQueue, 1, &submitInfo, info ? (VkFence)info->fence : nullptr));
+        VK_CHECK_RF(submitToQueue(cmdBuffer, waitSemaphores, waitValues, signalSemaphores, signalValues,
+            pLatencyInfo, info ? (VkFence)info->fence : VK_NULL_HANDLE));
 
         //SL_LOG_INFO("Submitting on %S index %u value %llu", name.c_str(), index, syncValue);
 
@@ -442,25 +643,6 @@ public:
         return completedValue >= m_fenceValue[m_index];
     }
 
-    WaitStatus waitCPUFence(Fence fence, uint64_t syncValue)
-    {
-        auto semaphore = (VkSemaphore)fence;
-        uint64_t completedValue;
-        VK_CHECK_RWS(m_ddt.GetSemaphoreCounterValue(m_device, semaphore, &completedValue));
-        if (completedValue < syncValue)
-        {
-            VkSemaphoreWaitInfo waitInfo;
-            waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-            waitInfo.pNext = NULL;
-            waitInfo.flags = 0;
-            waitInfo.semaphoreCount = 1;
-            waitInfo.pSemaphores = &semaphore;
-            waitInfo.pValues = &syncValue;
-            VK_CHECK_RWS(m_ddt.WaitSemaphores(m_device, &waitInfo, kMaxSemaphoreWaitUs));
-        }
-        return WaitStatus::eNoTimeout;
-    }
-
     void syncGPU(const GPUSyncInfo* info)
     {
         std::vector<chi::Fence> waitSemaphores;
@@ -480,23 +662,8 @@ public:
             signalValues.insert(signalValues.end(), info->signalValues.begin(), info->signalValues.end());
         }
 
-        VkTimelineSemaphoreSubmitInfo timelineInfo{};
-        timelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-        timelineInfo.pNext = NULL;
-        timelineInfo.waitSemaphoreValueCount = (uint32_t)waitValues.size();
-        timelineInfo.pWaitSemaphoreValues = waitValues.data();
-        timelineInfo.signalSemaphoreValueCount = (uint32_t)signalValues.size();
-        timelineInfo.pSignalSemaphoreValues = signalValues.data();
-
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.pNext = &timelineInfo;
-        submitInfo.waitSemaphoreCount = (uint32_t)waitSemaphores.size();
-        submitInfo.pWaitSemaphores = (VkSemaphore*)waitSemaphores.data();
-        submitInfo.signalSemaphoreCount = (uint32_t)signalSemaphores.size();
-        submitInfo.pSignalSemaphores = (VkSemaphore*)signalSemaphores.data();
-        submitInfo.pWaitDstStageMask = waitDstStageMask;
-        VK_CHECK_RV(m_ddt.QueueSubmit(m_cmdQueue, 1, &submitInfo, info ? (VkFence)info->fence : VK_NULL_HANDLE));
+        VK_CHECK_RV(submitToQueue(VK_NULL_HANDLE, waitSemaphores, waitValues, signalSemaphores, signalValues,
+            nullptr, info ? (VkFence)info->fence : VK_NULL_HANDLE));
     }
 
     bool signalGPUFenceAt(uint32_t index) override
@@ -595,7 +762,7 @@ public:
     int acquireNextBufferIndex(SwapChain chain, uint32_t& bufferIndex, Fence* waitSemaphore)
     {
         SwapChainVk* sc = (SwapChainVk*)chain;
-        const uint64_t timeout = 10 * 1000;
+        const uint64_t timeout = 2000000000; // 2 seconds
         bufferIndex = UINT32_MAX;
         // With VK it is important to always return the "error" code
         int res{};
@@ -616,14 +783,19 @@ public:
     {
         SwapChainVk* sc = (SwapChainVk*)chain;
         auto swapChain = (VkSwapchainKHR)sc->native;
-        const VkPresentInfoKHR info = 
+        const uint32_t SwapchainCount = 1;
+
+        // No present-id is chained here: SL does not use VK_KHR_present_wait, and LL2 frame
+        // attribution is handled separately on vkQueueSubmit (see CommandListContextVK::setLatencyFrameId).
+        // The app's own pNext chain in params is passed through unchanged.
+        const VkPresentInfoKHR info =
         {
             VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
             params,
             // Cannot wait here on present semaphore (however acquires next image has to wait before doing a copy to back buffer)
             1,
-            &m_presentSemaphore, 
-            1,
+            &m_presentSemaphore,
+            SwapchainCount,
             &swapChain,
             &m_bufferToPresent, nullptr
         };
@@ -644,14 +816,61 @@ public:
         return res;
     }
 
-    void getFrameStats(SwapChain chain, void* frameStats)
+    void delimitPresentRequest(uint32_t presentFrameIndex, uint32_t syncInterval, uint32_t flags, const void* presentParams) override
     {
-        assert(false);
-        SL_LOG_ERROR("Not implemented");
-        return;
+        if (!m_nsightInitialized)
+        {
+            return;
+        }
+        if (m_cmdQueue == VK_NULL_HANDLE)
+        {
+            SL_LOG_WARN("Vulkan command queue is null - skipping present request marker");
+            return;
+        }
+        uint32_t generatedFrameIndex{ 0 };
+        NGFX_DLSS_FG_PresentBoundary_Vulkan_Params params{
+            NGFX_DLSS_FG_PresentBoundary_Vulkan_Params_VER,
+            NGFX_For_Dlss_DLSS_FG_PresentBoundaryType_Application_Present_Requested,
+            generatedFrameIndex,
+            m_cmdQueue,
+            reinterpret_cast<const VkPresentInfoKHR*>(presentParams),
+            presentFrameIndex
+        };
+        NGFX_Result result{ NGFX_DLSS_FG_PresentBoundary_Vulkan(&params) };
+        if (result != NGFX_Result_Success && result != NGFX_Result_NotImplemented)
+        {
+            SL_LOG_WARN("delimitPresentRequest failed (%d)", result);
+        }
     }
 
-    void getLastPresentID(SwapChain chain, uint32_t& id)
+    void delimitFrame(uint32_t presentFrameIndex, int32_t genFrameIndex, bool isBegin, uint32_t syncInterval, uint32_t flags, const void* /*presentParams*/) override
+    {
+        if (!m_nsightInitialized)
+        {
+            return;
+        }
+        if (m_cmdQueue == VK_NULL_HANDLE)
+        {
+            SL_LOG_WARN("Vulkan command queue is null - skipping frame boundary marker");
+            return;
+        }
+        auto isGenerated{ genFrameIndex >= 0 };
+        NGFX_DLSS_FG_PresentBoundary_Vulkan_Params params{
+            NGFX_DLSS_FG_PresentBoundary_Vulkan_Params_VER,
+            ngfxFrameBoundaryType(isGenerated, isBegin),
+            isGenerated ? static_cast<uint32_t>(genFrameIndex) : 0,
+            m_cmdQueue,
+            nullptr,
+            presentFrameIndex
+        };
+        NGFX_Result result{ NGFX_DLSS_FG_PresentBoundary_Vulkan(&params) };
+        if (result != NGFX_Result_Success && result != NGFX_Result_NotImplemented)
+        {
+            SL_LOG_WARN("delimitFrame failed (%d)", result);
+        }
+    }
+
+    void getFrameStats(SwapChain chain, void* frameStats)
     {
         assert(false);
         SL_LOG_ERROR("Not implemented");
@@ -902,12 +1121,6 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     m_instance = (VkInstance)deviceArray[0];
     m_device = (VkDevice)deviceArray[1];
     m_physicalDevice = (VkPhysicalDevice)deviceArray[2];
-
-    #ifdef SL_WITH_NVLLVK
-    m_reflex = CreateNvLowLatencyVk(m_device, params);
-    #else
-    #error "Not implemented"
-    #endif
     
     // For callbacks we just need VkDevice
     Generic::init(m_device, params);
@@ -917,6 +1130,10 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     {
         return ComputeStatus::eNoImplementation;
     }
+
+    // OTA-safe synchronization2 signal: get() leaves m_sync2SubmitEnabled false if an older interposer
+    // never published the param, so SL keeps the v1 vkQueueSubmit path. See kVulkanSynchronization2Enabled.
+    m_parameters->get(sl::param::global::kVulkanSynchronization2Enabled, &m_sync2SubmitEnabled);
 
     m_vk = new interposer::VkTable;
     m_vk->getInstanceProcAddr = vk->getInstanceProcAddr;
@@ -936,10 +1153,36 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     m_ddt = m_vk->dispatchDeviceMap[m_device];
     m_idt = m_vk->dispatchInstanceMap[m_instance];
 
-    if (m_reflex)
+    if (m_ddt.CreatePrivateDataSlot)
     {
-        m_reflex->initDispatchTable(m_ddt);
+        VkPrivateDataSlotCreateInfo slotCI = { VK_STRUCTURE_TYPE_PRIVATE_DATA_SLOT_CREATE_INFO };
+        if (m_ddt.CreatePrivateDataSlot(m_device, &slotCI, nullptr, &m_privateDataSlot) != VK_SUCCESS)
+        {
+            SL_LOG_WARN("Failed to create VkPrivateDataSlot - swap chain private data will not be available");
+            m_privateDataSlot = VK_NULL_HANDLE;
+        }
     }
+    else
+    {
+        SL_LOG_WARN("vkCreatePrivateDataSlot not available (driver pre-1.3) - swap chain private data will not be available");
+    }
+
+    // VK_EXT_debug_utils is optional. When not enabled on the host VkInstance, SL's debug
+    // names (setDebugName, setDebugNameVk overloads) and profiling markers (begin/endProfilingImpl,
+    // queue*DebugUtilsLabelEXT) all silently no-op. Surface this at session start so the
+    // condition is visible without waiting for the first profiling marker.
+    if (m_ddt.SetDebugUtilsObjectNameEXT == nullptr)
+    {
+        SL_LOG_WARN("VK_EXT_debug_utils extension not enabled - VK debug names and profiling markers disabled!");
+    }
+
+    m_reflex = CreateVkNvLowLatency2(m_device, params, m_vk);
+    #ifdef SL_WITH_NVLLVK
+    if (!m_reflex)
+    {
+        m_reflex = CreateNvLowLatencyVk(m_device, params, m_vk);
+    }
+    #endif
 
     if(m_idt.CreateDebugUtilsMessengerEXT)
     {
@@ -973,7 +1216,7 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     VkResult result;
     {
         result = m_ddt.CreateSampler(m_device, &samplerCreateInfo, 0, &m_sampler[eSamplerLinearClamp]);
-        setDebugNameVk(m_sampler[eSamplerLinearClamp], "eSamplerLinearClamp");
+        setDebugNameVk(m_sampler[eSamplerLinearClamp], SL_COMPOSE_NAME(kComputeTag, "sampler.linear-clamp").c_str());
         assert(result == VK_SUCCESS);
     }
     {
@@ -981,14 +1224,14 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
         samplerCreateInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
         samplerCreateInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
         result = m_ddt.CreateSampler(m_device, &samplerCreateInfo, 0, &m_sampler[eSamplerLinearMirror]);
-        setDebugNameVk(m_sampler[eSamplerLinearClamp], "eSamplerLinearMirror");
+        setDebugNameVk(m_sampler[eSamplerLinearMirror], SL_COMPOSE_NAME(kComputeTag, "sampler.linear-mirror").c_str());
         assert(result == VK_SUCCESS);
     }
     {
         samplerCreateInfo.magFilter = VK_FILTER_NEAREST;
         samplerCreateInfo.minFilter = VK_FILTER_NEAREST;
         result = m_ddt.CreateSampler(m_device, &samplerCreateInfo, 0, &m_sampler[eSamplerPointMirror]);
-        setDebugNameVk(m_sampler[eSamplerLinearClamp], "eSamplerPointMirror");
+        setDebugNameVk(m_sampler[eSamplerPointMirror], SL_COMPOSE_NAME(kComputeTag, "sampler.point-mirror").c_str());
         assert(result == VK_SUCCESS);
     }
     {
@@ -996,7 +1239,7 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
         samplerCreateInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         samplerCreateInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         result = m_ddt.CreateSampler(m_device, &samplerCreateInfo, 0, &m_sampler[eSamplerPointClamp]);
-        setDebugNameVk(m_sampler[eSamplerLinearClamp], "eSamplerPointClamp");
+        setDebugNameVk(m_sampler[eSamplerPointClamp], SL_COMPOSE_NAME(kComputeTag, "sampler.point-clamp").c_str());
         assert(result == VK_SUCCESS);
     }
     m_idt.GetPhysicalDeviceMemoryProperties(m_physicalDevice, &m_vkPhysicalDeviceMemoryProperties);
@@ -1017,7 +1260,7 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     if (result != VK_SUCCESS) {
         return ComputeStatus::eError;
     }
-    setDebugNameVk(m_imageViewClear.descriptorSetLayout, "SL_imageViewClear_descriptorSetLayout");
+    setDebugNameVk(m_imageViewClear.descriptorSetLayout, SL_COMPOSE_NAME(kComputeTag, "descriptorSetLayout.imageViewClear").c_str());
 
     VkPushConstantRange range;
     range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1034,7 +1277,7 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     if (result != VK_SUCCESS) {
         return ComputeStatus::eError;
     }
-    setDebugNameVk(m_imageViewClear.pipelineLayout, "SL_imageViewClear_pipelineLayout");
+    setDebugNameVk(m_imageViewClear.pipelineLayout, SL_COMPOSE_NAME(kComputeTag, "pipelineLayout.imageViewClear").c_str());
 
     // Create the compute pipeline for image view clears
     VkShaderModule csm;
@@ -1058,7 +1301,7 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
     if (result != VK_SUCCESS) {
         return ComputeStatus::eError;
     }
-    setDebugNameVk(m_imageViewClear.doClear, "SL_imageViewClear_pipeline");
+    setDebugNameVk(m_imageViewClear.doClear, SL_COMPOSE_NAME(kComputeTag, "pipeline.imageViewClear").c_str());
 
     m_ddt.DestroyShaderModule(m_device, csm, nullptr);
 
@@ -1067,11 +1310,46 @@ ComputeStatus Vulkan::init(Device device, param::IParameters* params)
 
     genericPostInit();
 
+    initNsightActivity();
+
     return ComputeStatus::eOk;
+}
+
+bool Vulkan::initNsightActivityImpl(NGFX_ActivityType activity)
+{
+    NGFX_Result result{ NGFX_Result_Success };
+    switch (activity)
+    {
+        case NGFX_ActivityType_GraphicsCapture:
+        {
+            NGFX_GraphicsCapture_InitializeActivity_Vulkan_Params p{ NGFX_GraphicsCapture_InitializeActivity_Vulkan_Params_VER };
+            result = NGFX_GraphicsCapture_InitializeActivity_Vulkan(&p);
+            break;
+        }
+        case NGFX_ActivityType_GPUTrace:
+        {
+            NGFX_GPUTrace_InitializeActivity_Vulkan_Params p{ NGFX_GPUTrace_InitializeActivity_Vulkan_Params_VER };
+            result = NGFX_GPUTrace_InitializeActivity_Vulkan(&p);
+            break;
+        }
+        case NGFX_ActivityType_SystemProfiling:
+        {
+            NGFX_SystemProfiling_InitializeActivity_Vulkan_Params p{ NGFX_SystemProfiling_InitializeActivity_Vulkan_Params_VER };
+            result = NGFX_SystemProfiling_InitializeActivity_Vulkan(&p);
+            break;
+        }
+        default:
+            SL_LOG_VERBOSE("Unsupported NSight SDK activity (%d)!", activity);
+            return false;
+    }
+
+    return result == NGFX_Result_Success;
 }
 
 ComputeStatus Vulkan::shutdown()
 {
+    m_nsightInitialized = false;
+
     m_dispatchContext.clear();
 
     assert(m_device != NULL);
@@ -1121,6 +1399,12 @@ ComputeStatus Vulkan::shutdown()
     {
         m_idt.DestroyDebugUtilsMessengerEXT(m_instance, m_debugUtilsMessenger, nullptr);
         m_debugUtilsMessenger = VK_NULL_HANDLE;
+    }
+
+    if (m_privateDataSlot != VK_NULL_HANDLE && m_ddt.DestroyPrivateDataSlot)
+    {
+        m_ddt.DestroyPrivateDataSlot(m_device, m_privateDataSlot, nullptr);
+        m_privateDataSlot = VK_NULL_HANDLE;
     }
 
     delete m_vk;
@@ -1284,7 +1568,13 @@ ComputeStatus Vulkan::createKernel(void *blob, unsigned int blobSize, const char
         {
             data = new KernelDataVK{};
             data->hash = hash;
+            data->refcounter.store(1);
             m_kernels[hash] = data;
+        }
+        else
+        {
+            auto kernelData = (*it).second;
+            kernelData->refcounter.fetch_add(1);
         }
     }
     if (missing)
@@ -1326,18 +1616,31 @@ ComputeStatus Vulkan::destroyKernel(Kernel& kernel)
     }
 
     KernelDataVK *cubinVk = (KernelDataVK *)(*cubin).second;
-    cubinVk->destroy(m_ddt, m_device);
+    auto prev_count = cubinVk->refcounter.fetch_sub(1);
+    if (prev_count == 1)  // Was 1 before decrement, now 0
+    {
+        SL_LOG_VERBOSE("Destroying kernel %s", cubinVk->name.c_str());
+        cubinVk->destroy(m_ddt, m_device);
     
-    delete (*cubin).second;
-    m_kernels.erase(cubin);
-    kernel = {};
+        delete (*cubin).second;
+        m_kernels.erase(cubin);
+        kernel = {};
+    }
+    else
+    {
+        SL_LOG_VERBOSE("Destroying kernel %s doesn't really happen since other contexts still refer to it. Decreasing refcounter to %d.", cubinVk->name.c_str(), cubinVk->refcounter.load());
+    }
     return ComputeStatus::eOk;
 }
 
-ComputeStatus Vulkan::createCommandListContext(CommandQueue queue, uint32_t count, ICommandListContext*& ctx, const char friendlyName[])
+ComputeStatus Vulkan::createCommandListContext(ChiCommandQueue* queue,
+                                               uint32_t count,
+                                               ICommandListContext*& ctx,
+                                               const char friendlyName[])
 { 
     auto tmp = new CommandListContextVK();
-    tmp->init(this, m_vk, friendlyName, m_device, (CommandQueueVk*)queue, count);
+    tmp->init(this, m_vk, friendlyName, m_device, (CommandQueueVk*)queue, count, m_sync2SubmitEnabled);
+    tmp->m_nsightInitialized = m_nsightInitialized;
     ctx = tmp;
     return ComputeStatus::eOk;
 }
@@ -1361,7 +1664,29 @@ uint64_t Vulkan::getCompletedValue(Fence fence)
     return completedValue;
 }
 
-ComputeStatus Vulkan::createCommandQueue(CommandQueueType type, CommandQueue& queue, const char friendlyName[], uint32_t index)
+WaitStatus Vulkan::waitCPUFence(Fence fence, uint64_t syncValue)
+{
+    auto semaphore = (VkSemaphore)fence;
+    uint64_t completedValue;
+    VK_CHECK_RWS(m_ddt.GetSemaphoreCounterValue(m_device, semaphore, &completedValue));
+    if (completedValue < syncValue)
+    {
+        VkSemaphoreWaitInfo waitInfo;
+        waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        waitInfo.pNext = NULL;
+        waitInfo.flags = 0;
+        waitInfo.semaphoreCount = 1;
+        waitInfo.pSemaphores = &semaphore;
+        waitInfo.pValues = &syncValue;
+        VK_CHECK_RWS(m_ddt.WaitSemaphores(m_device, &waitInfo, kMaxSemaphoreWaitUs));
+    }
+    return WaitStatus::eNoTimeout;
+}
+
+ComputeStatus Vulkan::createCommandQueue(CommandQueueType type,
+                                         ChiCommandQueue*& queue,
+                                         const char friendlyName[],
+                                         uint32_t index)
 {
     queue = {};
     uint32_t queueFamily{}, queueIndex{}, queueCreateFlags{};
@@ -1391,12 +1716,13 @@ ComputeStatus Vulkan::createCommandQueue(CommandQueueType type, CommandQueue& qu
 
     VkQueue tmp{};
     CHI_CHECK(getDeviceQueue(queueFamily, queueIndex + index, queueCreateFlags, tmp));
-    queue = new chi::CommandQueueVk{ tmp, type, queueFamily, queueIndex + index };
+    queue = (ChiCommandQueue *)(new chi::CommandQueueVk{ tmp, type, queueFamily, queueIndex + index });
+    setDebugName((chi::CommandQueueVk*)queue, friendlyName);
 
     return ComputeStatus::eOk;
 }
 
-ComputeStatus Vulkan::destroyCommandQueue(CommandQueue& queue)
+ComputeStatus Vulkan::destroyCommandQueue(ChiCommandQueue* queue)
 { 
     auto tmp = (chi::CommandQueueVk*)queue;
     delete tmp;
@@ -1513,7 +1839,7 @@ ComputeStatus Vulkan::bindConsts(uint32_t base, uint32_t reg, void *data, size_t
         slot.registerIndex = base;
         ResourceDescription cbDesc = ResourceDescription{alignedDataSize * instances,1,chi::NativeFormatUnknown,chi::eHeapTypeUpload, chi::ResourceState::eConstantBuffer};
         Resource cb;
-        CHI_CHECK(createBuffer(cbDesc, cb, "const buffer"));
+        CHI_CHECK(createBuffer(cbDesc, cb, SL_COMPOSE_NAME(kComputeTag, "buf.const").c_str()));
         slot.handles.push_back(cb);
         slot.mapped = {};
         auto info = (sl::Resource*)cb;
@@ -1687,7 +2013,7 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
             dslInfo.pBindings = bindings.data();
             //dslInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
             VK_CHECK(m_ddt.CreateDescriptorSetLayout(m_device, &dslInfo, 0, &thread.kernel->descriptorSetLayout));
-            setDebugNameVk(thread.kernel->descriptorSetLayout, "SL_thread_kernel_descriptorSetLayout");
+            setDebugNameVk(thread.kernel->descriptorSetLayout, SL_COMPOSE_NAME(kComputeTag, "descriptorSetLayout.thread-kernel").c_str());
 
             VkPipelineLayoutCreateInfo plInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
             plInfo.setLayoutCount = 1;
@@ -1695,7 +2021,7 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
             plInfo.pushConstantRangeCount = 0;
             plInfo.pPushConstantRanges = {};
             VK_CHECK(m_ddt.CreatePipelineLayout(m_device, &plInfo, 0, &thread.kernel->pipelineLayout));
-            setDebugNameVk(thread.kernel->pipelineLayout, "SL_thread_kernel_pipelineLayout");
+            setDebugNameVk(thread.kernel->pipelineLayout, SL_COMPOSE_NAME(kComputeTag, "pipelineLayout.thread-kernel").c_str());
         }
 
         auto id = GetCurrentThreadId();
@@ -1711,7 +2037,7 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
         PoolDescCombo& combo = thread.signatureToDesc[thread.signature];
         VK_CHECK(m_ddt.CreateDescriptorPool(m_device, &descriptorPoolInfo, nullptr, &combo.pool));
         std::stringstream name{};
-        name << "SL_thread_" << id << "_descriptor_pool";
+        name << SL_COMPOSE_NAME(kComputeTag, "descriptorPool.thread") << "." << id;
         setDebugNameVk(combo.pool, name.str().c_str());
 
         combo.descSetData.descSet.resize(thread.kernel->numDescriptorSets);
@@ -1720,7 +2046,7 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
             VkDescriptorSetAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO , nullptr, combo.pool, 1, &thread.kernel->descriptorSetLayout };
             VK_CHECK(m_ddt.AllocateDescriptorSets(m_device, &allocInfo, &combo.descSetData.descSet[i]));
             name = std::stringstream{};
-            name << "SL_thread_" << id << "_kernel_descriptor_set_" << i;
+            name << SL_COMPOSE_NAME(kComputeTag, "descriptorSet.thread") << "." << id << ".kernel." << i;
             setDebugNameVk(combo.descSetData.descSet[i], name.str().c_str());
         }
 
@@ -1848,7 +2174,7 @@ ComputeStatus Vulkan::processDescriptors(DispatchData& thread)
         pipelineInfo.stage.module = thread.kernel->shaderModule;
         pipelineInfo.stage.pName = "main";
         VK_CHECK(m_ddt.CreateComputePipelines(m_device, nullptr, 1, &pipelineInfo, 0, &thread.kernel->pipeline));
-        setDebugNameVk(thread.kernel->pipeline, "SL_thread_kernel_pipeline");
+        setDebugNameVk(thread.kernel->pipeline, SL_COMPOSE_NAME(kComputeTag, "pipeline.thread-kernel").c_str());
     }
     return ComputeStatus::eOk;
 }
@@ -2023,7 +2349,7 @@ ComputeStatus Vulkan::createTexture2DResourceSharedImpl(ResourceDescription &res
             return ComputeStatus::eError;
         }
         std::stringstream name{};
-        name << InFriendlyName << "_device_memory";
+        name << InFriendlyName << ".device_memory";
         setDebugNameVk(deviceMemory, name.str().c_str());
 
         result = m_ddt.BindImageMemory(m_device, image, deviceMemory, 0);
@@ -2915,7 +3241,6 @@ std::wstring Vulkan::getDebugName(Resource res)
     return L"Unknown";
 }
 
-#ifdef SL_DEBUG
 #define SET_VK_DEBUG_NAME(type, vk_object_type) \
     ComputeStatus Vulkan::setDebugNameVk(type vkStruct, const char* name) \
     { \
@@ -2934,13 +3259,6 @@ std::wstring Vulkan::getDebugName(Resource res)
         m_ddt.SetDebugUtilsObjectNameEXT(m_device, &info); \
         return ComputeStatus::eOk; \
     }
-#else
-#define SET_VK_DEBUG_NAME(type, vk_object_type) \
-    ComputeStatus Vulkan::setDebugNameVk(type , const char* ) \
-    { \
-        return ComputeStatus::eOk; \
-    }
-#endif
 
 SET_VK_DEBUG_NAME(VkDescriptorSet, VK_OBJECT_TYPE_DESCRIPTOR_SET)
 SET_VK_DEBUG_NAME(VkDescriptorSetLayout, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT)
@@ -2957,7 +3275,6 @@ SET_VK_DEBUG_NAME(VkImageView, VK_OBJECT_TYPE_IMAGE_VIEW)
 
 ComputeStatus Vulkan::setDebugName(Resource InOutResource, const char InFriendlyName[])
 {
-#ifdef SL_DEBUG
     sl::Resource* vkResource = (sl::Resource*) InOutResource;
 
     // The VK_EXT_debug_utils may not have been enabled so don't try to set names by default
@@ -3073,7 +3390,6 @@ ComputeStatus Vulkan::setDebugName(Resource InOutResource, const char InFriendly
         };
         m_ddt.SetDebugUtilsObjectNameEXT(m_device, &ObjectNameInfo);
     }
-#endif
     return ComputeStatus::eOk;
 }
 
@@ -3115,6 +3431,68 @@ ComputeStatus Vulkan::copyBufferToReadbackBuffer(CommandList InCmdList, Resource
     return ComputeStatus::eOk;
 }
 
+#if SL_ENABLE_PROFILING
+ComputeStatus Vulkan::beginProfilingImpl(CommandList cmdList, const char* marker, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (m_ddt.CmdBeginDebugUtilsLabelEXT == NULL)
+    {
+        return ComputeStatus::eNotSupported;
+    }
+
+    VkDebugUtilsLabelEXT labelInfo = { VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT };
+    labelInfo.pLabelName = marker;
+    labelInfo.color[0] = r / 255.0f;
+    labelInfo.color[1] = g / 255.0f;
+    labelInfo.color[2] = b / 255.0f;
+    labelInfo.color[3] = 1.0f;
+    m_ddt.CmdBeginDebugUtilsLabelEXT((VkCommandBuffer)cmdList, &labelInfo);
+
+    return ComputeStatus::eOk;
+}
+
+ComputeStatus Vulkan::endProfilingImpl(CommandList cmdList)
+{
+    if (m_ddt.CmdEndDebugUtilsLabelEXT == NULL)
+    {
+        return ComputeStatus::eNotSupported;
+    }
+
+    m_ddt.CmdEndDebugUtilsLabelEXT((VkCommandBuffer)cmdList);
+
+    return ComputeStatus::eOk;
+}
+
+ComputeStatus Vulkan::beginProfilingQueueImpl(CommandQueue cmdQueue, const char* marker, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (m_ddt.QueueBeginDebugUtilsLabelEXT == NULL)
+    {
+        return ComputeStatus::eNotSupported;
+    }
+
+    VkDebugUtilsLabelEXT labelInfo = { VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT };
+    labelInfo.pLabelName = marker;
+    labelInfo.color[0] = r / 255.0f;
+    labelInfo.color[1] = g / 255.0f;
+    labelInfo.color[2] = b / 255.0f;
+    labelInfo.color[3] = 1.0f;
+    m_ddt.QueueBeginDebugUtilsLabelEXT((VkQueue)cmdQueue, &labelInfo);
+
+    return ComputeStatus::eOk;
+}
+
+ComputeStatus Vulkan::endProfilingQueueImpl(CommandQueue cmdQueue)
+{
+    if (m_ddt.QueueEndDebugUtilsLabelEXT == NULL)
+    {
+        return ComputeStatus::eNotSupported;
+    }
+
+    m_ddt.QueueEndDebugUtilsLabelEXT((VkQueue)cmdQueue);
+
+    return ComputeStatus::eOk;
+}
+#endif
+
 ComputeStatus Vulkan::beginPerfSection(CommandList cmdList, const char *key, unsigned int node, bool reset)
 {
     std::scoped_lock lock(m_mutexProfiler);
@@ -3150,7 +3528,7 @@ ComputeStatus Vulkan::beginPerfSection(CommandList cmdList, const char *key, uns
             return ComputeStatus::eError;
         }
         std::stringstream name{};
-        name << "SL_query_pool_" << Data.QueryIdx;
+        name << SL_COMPOSE_NAME(kComputeTag, "queryPool") << "." << Data.QueryIdx;
         setDebugNameVk(Data.QueryPool[Data.QueryIdx], name.str().c_str());
         m_ddt.CmdResetQueryPool(commandBuffer, Data.QueryPool[Data.QueryIdx], 0, 2);
     }
@@ -3200,6 +3578,22 @@ ComputeStatus Vulkan::endPerfSection(CommandList cmdList, const char *key, float
     return ComputeStatus::eOk;
 }
 
+bool Vulkan::signalCPUFence(Fence fence, uint64_t syncValue)
+{
+    VkSemaphoreSignalInfo signalInfo{};
+    signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
+    signalInfo.semaphore = (VkSemaphore)fence;
+    signalInfo.value = syncValue;
+
+    VkResult result = m_ddt.SignalSemaphore(m_device, &signalInfo);
+    if (result != VK_SUCCESS)
+    {
+        SL_LOG_ERROR("Failed to signal semaphore from CPU - error %d", result);
+        return false;
+    }
+    return true;
+}
+
 ComputeStatus Vulkan::getSwapChainBuffer(SwapChain swapchain, uint32_t index, Resource& buffer)
 {
     auto* sc = (SwapChainVk*)swapchain;
@@ -3227,11 +3621,12 @@ ComputeStatus Vulkan::getSwapChainBuffer(SwapChain swapchain, uint32_t index, Re
     VkImageView imageView;
     VK_CHECK(m_ddt.CreateImageView(m_device, &texViewCreateInfo, 0, &imageView));
     std::stringstream name{};
-    name << "SL_swapchain_image_" << index << "_view";
+    name << SL_COMPOSE_NAME(kComputeTag, "imageView.swapchain") << "." << index;
     setDebugNameVk(imageView, name.str().c_str());
 
     // This pointer is deleted when DestroyResource is called on the object.
     buffer = new sl::Resource{ ResourceType::eTex2d, swapchainImages[index], nullptr, imageView };
+    buffer->internalFlags = sl::Resource::eVulkanSwapChainImage;
     buffer->nativeFormat = sc->info.imageFormat;
     buffer->width = sc->info.imageExtent.width;
     buffer->height = sc->info.imageExtent.height;
@@ -3251,6 +3646,7 @@ ComputeStatus Vulkan::getNativeFormat(Format format, NativeFormat& native)
     {
         case eFormatRGB10A2UN:  native = VK_FORMAT_A2B10G10R10_UNORM_PACK32; break;
         case eFormatRGBA8UN:    native = VK_FORMAT_R8G8B8A8_UNORM; break;
+        case eFormatRGBA8SN:    native = VK_FORMAT_R8G8B8A8_SNORM; break;
         case eFormatBGRA8UN:    native = VK_FORMAT_B8G8R8A8_UNORM; break;
         case eFormatR8UN:       native = VK_FORMAT_R8_UNORM; break;
         case eFormatRGBA32F:    native = VK_FORMAT_R32G32B32A32_SFLOAT; break;
@@ -3292,6 +3688,7 @@ ComputeStatus Vulkan::getNativeFormat(Format format, NativeFormat& native)
         case VK_FORMAT_B8G8R8A8_SRGB:               format = eFormatSBGRA8UN; break;
         case VK_FORMAT_B8G8R8A8_UNORM:              format = eFormatBGRA8UN; break;
         case VK_FORMAT_R8G8B8A8_UNORM:              format = eFormatRGBA8UN; break;
+        case VK_FORMAT_R8G8B8A8_SNORM:              format = eFormatRGBA8SN; break;
         case VK_FORMAT_R32G32B32A32_SFLOAT:         format = eFormatRGBA32F; break;
         case VK_FORMAT_R32G32B32_SFLOAT:            format = eFormatRGB32F; break;
         case VK_FORMAT_R16G16B16A16_SFLOAT:         format = eFormatRGBA16F; break;
@@ -3350,23 +3747,40 @@ ComputeStatus Vulkan::getNativeFormat(Format format, NativeFormat& native)
      return m_reflex->setMarker(marker, frameId);
  }
 
- ComputeStatus Vulkan::notifyOutOfBandCommandQueue(CommandQueue queue, OutOfBandCommandQueueType type)
+ ComputeStatus Vulkan::notifyOutOfBandCommandQueue(ChiCommandQueue* queue, OutOfBandCommandQueueType type)
  {
      CHECK_REFLEX();
      return m_reflex->notifyOutOfBandCommandQueue(queue, type);
  }
- ComputeStatus Vulkan::setAsyncFrameMarker(CommandQueue queue, PCLMarker marker, uint64_t frameId)
- {
-     CHECK_REFLEX();
-     SL_LOG_WARN_ONCE("Vulkan setAsyncFrameMarker is not implemented!");
-     return m_reflex->setAsyncFrameMarker(queue, marker, frameId);
- }
- ComputeStatus Vulkan::setLatencyMarker(CommandQueue queue, PCLMarker marker, uint64_t frameId)
- {
-     CHECK_REFLEX();
-     SL_LOG_WARN_ONCE("Vulkan setLatencyMarker is not implemented!");
-     return ComputeStatus::eOk;
- }
+
+ComputeStatus Vulkan::setAsyncFrameMarker(CommandQueue, PCLMarker marker, uint64_t frameId)
+{
+    // "Async" markers are for DirectX, Vk instead gets a presentId in the next chain to vkQueueSubmit.
+    // Track down "SetAsyncFrameMarker missing in VK_NV_low_latency2 extension" email thread for longer discussion.
+    // So, we use regular marker implementation here.
+    //
+    // VK_NV_low_latency2 has no async-marker channel: every marker lands on the same swapchain timeline
+    // via vkSetLatencyMarkerNV (and v1's NvLL_VK_SetLatencyMarker is likewise single-channel), unlike
+    // D3D where SL's async present markers go through a separate NvAPI channel. So if the app and SL
+    // both emit regular PRESENT_START/END they double-stamp the driver at the same frame id.
+    //
+    // Suppress SL's PRESENT markers only when the app emits its own (detected and latched via
+    // appOwnsPresentMarkers): that removes the duplication for self-emitting apps while preserving the
+    // behavior for apps that cannot emit present markers (e.g. Unity), where SL remains the sole source.
+    // The genuinely out-of-band markers (OOB present/render-submit, late-warp) are SL's alone and are
+    // always forwarded.
+    if ((marker == PCLMarker::ePresentStart || marker == PCLMarker::ePresentEnd) && appOwnsPresentMarkers())
+    {
+        return ComputeStatus::eOk;
+    }
+    return setReflexMarker(marker, frameId);
+}
+
+ComputeStatus Vulkan::setLatencyMarker(CommandQueue queue, PCLMarker marker, uint64_t frameId)
+{
+    // TODO: ask @esullivan and @chansen.  Seems NvAPI_D3D_SetLatencyMarker was added for LW?
+    return setReflexMarker(marker, frameId);
+}
 
  ComputeStatus Vulkan::fillSupportedDeviceExtensions()
  {
@@ -3403,5 +3817,56 @@ ComputeStatus Vulkan::getNativeFormat(Format format, NativeFormat& native)
      }
      return ComputeStatus::eNotSupported;
  }
+
+ComputeStatus Vulkan::setSwapChainPrivateData(void* nativeSwapChain, void* data)
+{
+    if (!nativeSwapChain) return ComputeStatus::eInvalidArgument;
+    if (m_privateDataSlot == VK_NULL_HANDLE || !m_ddt.SetPrivateData)
+    {
+        SL_LOG_WARN("VkPrivateDataSlot not available");
+        return ComputeStatus::eNotSupported;
+    }
+    auto swapchain = (VkSwapchainKHR)nativeSwapChain;
+    auto res = m_ddt.SetPrivateData(m_device, VK_OBJECT_TYPE_SWAPCHAIN_KHR, (uint64_t)swapchain, m_privateDataSlot, reinterpret_cast<uint64_t>(data));
+    if (res != VK_SUCCESS)
+    {
+        SL_LOG_ERROR("vkSetPrivateData failed with %d", res);
+        return ComputeStatus::eError;
+    }
+    return ComputeStatus::eOk;
+}
+
+ComputeStatus Vulkan::getSwapChainPrivateData(void* nativeSwapChain, void** data)
+{
+    if (!nativeSwapChain || !data) return ComputeStatus::eInvalidArgument;
+    if (m_privateDataSlot == VK_NULL_HANDLE || !m_ddt.GetPrivateData)
+    {
+        return ComputeStatus::eNotSupported;
+    }
+    uint64_t raw = 0;
+    m_ddt.GetPrivateData(m_device, VK_OBJECT_TYPE_SWAPCHAIN_KHR, (uint64_t)(VkSwapchainKHR)nativeSwapChain, m_privateDataSlot, &raw);
+    *data = reinterpret_cast<void*>(raw);
+    return ComputeStatus::eOk;
+}
+
+bool Vulkan::areLatencyIdsSupported() const
+{
+    // Only the LL2 backend consumes VkLatencySubmissionPresentIdNV; the NvAPI v1 backend does not.
+    // m_reflex is set once during init() and not swapped afterwards, so this is safe to read here.
+    return m_reflex && m_reflex->supportsLatencySubmissionPresentId();
+}
+
+ComputeStatus Vulkan::notifyCreateSwapchain(SwapChain chain, bool isLatencyModeEnabled)
+{
+    CHECK_REFLEX();
+    return m_reflex->notifyCreateSwapchain(chain, isLatencyModeEnabled);
+}
+
+ComputeStatus Vulkan::notifyDestroySwapchain(SwapChain chain)
+{
+    CHECK_REFLEX();
+    return m_reflex->notifyDestroySwapchain(chain);
+}
+
 }
 }

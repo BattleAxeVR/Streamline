@@ -31,18 +31,31 @@ enum class DLSSDPreset : uint32_t
 {
     //! Default behavior, may or may not change after an OTA
     eDefault,
-    ePresetA,
-    ePresetB,
-    ePresetC,
-    ePresetD,
-    ePresetE,
-    ePresetG,
+                    // ePresetA removed, use preset D, E or F
+                    // ePresetB removed, use preset D, E or F
+                    // ePresetC removed, use preset D, E or F
+    ePresetD = 4,   // Transformer model
+    ePresetE = 5,   // Transformer model
+    ePresetF = 6,   // Latest and default transformer model
+    ePresetG = 7,   // Reverts to default
+    ePresetH = 8,   // Reverts to default
+    ePresetI = 9,   // Reverts to default
+    ePresetJ = 10,  // Reverts to default
+    ePresetK = 11,  // Reverts to default
+    ePresetL = 12,  // Reverts to default
+    ePresetM = 13,  // Reverts to default. Not recommended to use
+    ePresetN = 14,  // Reverts to default. Not recommended to use
+    ePresetO = 15,  // Reverts to default. Not recommended to use
+
+    eCount
 };
 
 enum class DLSSDNormalRoughnessMode : uint32_t
 {
     eUnpacked,  // App needs to provide Normal resource and Roughness resource separately.
     ePacked,    // App needs to write Roughness to w channel of Normal resource.
+
+    eCount
 };
 
 // {0AD87504-774E-4BF3-9633-A44D1F7F9CB8}

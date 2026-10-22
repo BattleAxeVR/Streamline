@@ -31,7 +31,6 @@
 #include "external/json/include/nlohmann/json.hpp"
 using json = nlohmann::json;
 
-
 struct ID3D12Device;
 struct ID3D11Device;
 
@@ -75,14 +74,13 @@ struct FeatureContext
     PFun_slFreeResources* freeResources{};
     PFun_slEvaluateFeature* evaluate{};
     PFun_slSetTag* setTag{};
+    PFun_slSetTagForFrame* setTagForFrame{};
     PFun_slSetConstants* setConstants{};
     PFun_slIsSupported* isSupported{};
 };
 
 struct IPluginManager
 {
-
-
     virtual Result loadPlugins() = 0;
     virtual Result unloadPlugins() = 0;
 
@@ -116,8 +114,16 @@ struct IPluginManager
     virtual const FeatureContext* getFeatureContext(Feature feature) = 0;
 
     virtual bool getExternalFeatureConfig(Feature feature, std::string& configAsText) = 0;
+    virtual Result getFeatureSupportedExternalConfig(Feature feature) = 0;
     virtual bool getLoadedFeatureConfigs(std::vector<json>& configList) const = 0;
     virtual bool getLoadedFeatures(std::vector<Feature>& featureList) const = 0;
+    virtual bool getLoadedFeatureVersion(Feature feature, sl::Version& version) const = 0;
+
+    //! Surface-to-HWND mapping for Vulkan.
+    //! Stored here because vkCreateWin32SurfaceKHR fires before plugins are initialized.
+    virtual void setSurfaceWindow(VkSurfaceKHR surface, HWND hwnd) = 0;
+    virtual void removeSurfaceWindow(VkSurfaceKHR surface) = 0;
+    virtual HWND getSurfaceWindow(VkSurfaceKHR surface) const = 0;
 };
 
 IPluginManager* getInterface();

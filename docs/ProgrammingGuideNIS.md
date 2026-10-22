@@ -1,11 +1,12 @@
 
+
 Streamline - NIS
 =======================
 
 >The focus of this guide is on using Streamline to integrate the NVIDIA Image Scaling (NIS) SDK into an application.  For more information about NIS itself, please visit the [NVIDIA Image Scaling SDK Github Page](https://github.com/NVIDIAGameWorks/NVIDIAImageScaling)  
 >For information on user interface considerations when using the NIS plugin, please see the ["RTX UI Developer Guidelines.pdf"](<RTX UI Developer Guidelines.pdf>) document included with this SDK.
 
-Version 2.7.2
+Version 2.14.16
 =======
 
 ### Introduction
@@ -14,7 +15,7 @@ The NVIDIA Image Scaling SDK (NIS) provides a single spatial scaling and sharpen
 
 The directional scaling and sharpening algorithm are combined together in NVScaler while NVSharpen only implements the adaptive-directional-sharpening algorithm. Both algorithms are provided as compute shaders and developers are free to integrate them in their applications. Note that if you integrate NVScaler, you should NOT also integrate NVSharpen, as NVScaler already includes a sharpening pass.
 
-For more information on the NVIDIA Image scaling SDK visit https://github.com/NVIDIAGameWorks/NVIDIAImageScaling
+For more information on the NVIDIA Image scaling SDK visit [NVIDIA Image Scaling SDK](https://github.com/NVIDIAGameWorks/NVIDIAImageScaling)
 
 ### 1.0 INITIALIZE AND SHUTDOWN
 
@@ -89,10 +90,12 @@ if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&factory)))
                 // Requested feature is not supported on the system, fallback to the default method
                 switch (result)
                 {
-                    case sl::Result::eErrorOSOutOfDate:         // inform user to update OS
-                    case sl::Result::eErrorDriverOutOfDate:     // inform user to update driver
-                    case sl::Result::eErrorNoSupportedAdapter:  // cannot use this adapter (older or non-NVDA GPU etc)
-                    // and so on ...
+                    case sl::Result::eErrorOSOutOfDate:             // inform user to update OS
+                    case sl::Result::eErrorDriverOutOfDate:         // inform user to update driver
+                    case sl::Result::eErrorNoSupportedAdapterFound: // cannot use this adapter (older or non-NVDA
+                                                                    // GPU etc)
+                        break;
+                        // and so on ...
                 };
             }
             else
@@ -124,7 +127,7 @@ sl::ResourceTag colorOutTag = sl::ResourceTag {&colorOut, sl::kBufferTypeScaling
 
 // Resources must be valid at this point and valid command list must be provided since resources are volatile
 sl::Resource inputs[] = {colorInTag, colorOutTag};
-slSetTag(viewport, inputs, _countof(inputs), cmdList);
+slSetTagForFrame(*currentFrame, viewport, inputs, _countof(inputs), cmdList);
 
 // SECOND SCENARIO
 
@@ -134,11 +137,14 @@ sl::ResourceTag colorOutTag = sl::ResourceTag {&colorOut, sl::kBufferTypeScaling
 
 // Resources are immutable so they are valid all the time, no need to provide command list since no copies need to be made
 std::vector<sl::Resource> inputs = {colorInTag, colorOutTag};
-slSetTag(viewport, inputs, _countof(inputs), cmdList);
+slSetTagForFrame(*currentFrame, viewport, inputs, _countof(inputs), cmdList);
 
 ```
 > **IMPORTANT**
 > When using Vulkan additional information about the resource must be provided (width, height, format, image view etc). See `sl::Resource` for details.
+
+> **IMPORTANT**
+> If previously tagged resources are destroyed (whether they are volatile or not), `slFreeResources` must be called unless NIS is no longer used.
 
 ### 4.0 PROVIDE NIS OPTIONS
 
@@ -172,7 +178,7 @@ On your rendering thread, call `slEvaluateFeature` at the appropriate location w
 // Make sure NIS is available and user selected this option in the UI
 if(useNIS) 
 {
-    // NOTE: We can provide all inputs here or separately using slSetTag or slNISSetOptions
+    // NOTE: We can provide all inputs here or separately using slSetTagForFrame or slNISSetOptions
 
     // Inform SL that NIS should be injected at this point for the specific viewport
     const sl::BaseStructure* inputs[] = {&myViewport};
@@ -194,5 +200,4 @@ else
 
 > **IMPORTANT:**
 > Plase note that **host is responsible for restoring the command buffer(list) state** after calling `slEvaluateFeature`. For more details on which states are affected please see [restore pipeline section](./ProgrammingGuideManualHooking.md#70-restoring-command-listbuffer-state)
-
 

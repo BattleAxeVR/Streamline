@@ -1,11 +1,12 @@
 
+
 Streamline - DLSS
 =======================
 
 >The focus of this guide is on using Streamline to integrate DLSS into an application.  For more information about DLSS itself, please visit the [NVIDIA Developer DLSS Page](https://developer.nvidia.com/rtx/dlss)
 >For information on user interface considerations when using the DLSS plugin, please see the ["RTX UI Developer Guidelines.pdf"](<RTX UI Developer Guidelines.pdf>) document included with this SDK.
 
-Version 2.7.2
+Version 2.14.16
 =======
 
 ### 1.0 INITIALIZE AND SHUTDOWN
@@ -81,10 +82,12 @@ if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&factory)))
                 // Requested feature is not supported on the system, fallback to the default method
                 switch (result)
                 {
-                    case sl::Result::eErrorOSOutOfDate:         // inform user to update OS
-                    case sl::Result::eErrorDriverOutOfDate:     // inform user to update driver
-                    case sl::Result::eErrorNoSupportedAdapter:  // cannot use this adapter (older or non-NVDA GPU etc)
-                    // and so on ...
+                    case sl::Result::eErrorOSOutOfDate:             // inform user to update OS
+                    case sl::Result::eErrorDriverOutOfDate:         // inform user to update driver
+                    case sl::Result::eErrorNoSupportedAdapterFound: // cannot use this adapter (older or non-NVDA
+                                                                    // GPU etc)
+                        break;
+                        // and so on ...
                 };
             }
             else
@@ -145,7 +148,7 @@ sl::ResourceTag exposureTag = sl::ResourceTag {&exposure, sl::kBufferTypeExposur
 
 // Tag in group
 sl::Resource inputs[] = {colorInTag, colorOutTag, depthTag, mvecTag};
-slSetTag(viewport, inputs, _countof(inputs), cmdList);
+slSetTagForFrame(*currentFrame, viewport, inputs, _countof(inputs), cmdList);
 ```
 
 > **NOTE:**
@@ -164,11 +167,11 @@ sl::DLSSOptions dlssOptions = {};
 // and established while evaluating DLSS SR Image Quality for your Application.
 // It will be set to DSSPreset::eDefault if unspecified.
 // Please Refer to section 3.12 of the DLSS Programming Guide for details.
-dlssOptions.dlaaPreset = sl::DLSSPreset::ePresetA;
-dlssOptions.qualityPreset = sl::DLSSPreset::ePresetD;
-dlssOptions.balancedPreset = sl::DLSSPreset::ePresetD;
-dlssOptions.performancePreset = sl::DLSSPreset::ePresetD;
-dlssOptions.ultraPerformancePreset = sl::DLSSPreset::ePresetA;
+dlssOptions.dlaaPreset = sl::DLSSPreset::ePresetK;
+dlssOptions.qualityPreset = sl::DLSSPreset::ePresetK;
+dlssOptions.balancedPreset = sl::DLSSPreset::ePresetK;
+dlssOptions.performancePreset = sl::DLSSPreset::ePresetM;
+dlssOptions.ultraPerformancePreset = sl::DLSSPreset::ePresetL;
 // These are populated based on user selection in the UI
 dlssOptions.mode = myUI->getDLSSMode(); // e.g. sl::eDLSSModeBalanced;
 dlssOptions.outputWidth = myUI->getOutputWidth();    // e.g 1920;
@@ -182,6 +185,10 @@ if(SL_FAILED(result, slDLSSSetOptions(viewport, dlssOptions)))
     // Handle error here, check the logs
 }
 ```
+
+> **NOTE:**
+> `sl::DLSSPreset::ePresetA` to `sl::DLSSPreset::ePresetD` are no longer available. `sl::DLSSPreset::ePresetG` to `sl::DLSSPreset::ePresetI` are reserved and should also not be used.
+`sl::DLSSPreset::ePresetE` and `sl::DLSSPreset::ePresetF` are legacy presets. Support for these has been deprecated.
 
 > **NOTE:**
 > To turn off DLSS set `sl::DLSSOptions.mode` to `sl::DLSSMode::eOff`, note that this does NOT release any resources, for that please use `slFreeResources`
@@ -212,7 +219,7 @@ if(SL_FAILED(result, slSetConstants(consts, *frameToken, myViewport))) // consta
     // Handle error, check logs
 }
 ```
-For more details please see [common constants](ProgrammingGuide.md#2101-common-constants)
+For more details please see [common constants](ProgrammingGuide.md#2111-common-constants)
 
 ### 7.0 ADD DLSS TO THE RENDERING PIPELINE
 
@@ -333,4 +340,3 @@ If the DLSS output does not look right please check the following:
 * Make sure that jitter offset values are in pixel space
 * `NVSDK_NGX_Parameter_FreeMemOnRelease` is replaced with `slFreeResources`
 * `NVSDK_NGX_DLSS_Feature_Flags_MVLowRes` is handled automatically based on tagged motion vector buffer's size and extent.
-

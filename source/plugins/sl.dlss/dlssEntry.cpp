@@ -45,8 +45,6 @@
 #include "source/plugins/sl.imgui/imgui.h"
 #include "source/plugins/sl.dlss/dlss_shared.h"
 
-#include "source/platforms/sl.chi/capture.h"
-
 #include "_artifacts/shaders/mvec_cs.h"
 #include "_artifacts/shaders/mvec_spv.h"
 #include "_artifacts/json/dlss_json.h"
@@ -110,9 +108,6 @@ struct DLSSContext
 
     common::NGXContext* ngxContext = {};
     sl::chi::ICompute* compute;
-#ifdef SL_CAPTURE
-    sl::chi::ICapture* capture;
-#endif
     sl::chi::Kernel mvecKernel;
 
 #ifndef SL_PRODUCTION
@@ -223,7 +218,7 @@ void updateEmbeddedJSON(json& config)
         sl::Version detectedDriver(caps->driverVersionMajor, caps->driverVersionMinor, 0);
         if (detectedDriver < minDriver)
         {
-            SL_LOG_WARN("sl.dlss requires driver %s or newer - detected %s - sl.dlss will be disabled", minDriver.toStr().c_str(), detectedDriver.toStr().c_str());
+            SL_LOG_WARN("%s requires driver %s or newer - detected %s - %s will be disabled", api::getPluginName(), minDriver.toStr().c_str(), detectedDriver.toStr().c_str(), api::getPluginName());
         }
         else
         {
@@ -270,7 +265,7 @@ void updateEmbeddedJSON(json& config)
     }
     else
     {
-        SL_LOG_WARN("sl.dlss not supported on current hardware");
+        SL_LOG_WARN("%s not supported on current hardware", api::getPluginName());
     }
 }
 
@@ -370,9 +365,16 @@ Result dlssBeginEvent(chi::CommandList pCmdList, const common::EventData& data, 
             {
                 SL_LOG_INFO("Detected resize, recreating DLSSContext feature");
                 // Errors logged by sl.common
-                ctx.ngxContext->releaseFeature(viewport.handle, "sl.dlss");
+
+                // Delayed releaseFeature call by 3 frames to avoid race conditions
+                auto releaseFeatureLambda = [&ctx, handle = viewport.handle](void) -> void {
+                    ctx.ngxContext->releaseFeature(handle, api::getPluginName());
+                };
+                CHI_VALIDATE(ctx.compute->destroy(releaseFeatureLambda, 3));
+
                 viewport.handle = {};
                 ctx.compute->destroyResource(viewport.mvec);
+                viewport.mvec = nullptr;
             }
 
             {
@@ -400,7 +402,7 @@ Result dlssBeginEvent(chi::CommandList pCmdList, const common::EventData& data, 
 
                 // Optional
                 CommonResource exposure = {};
-                getTaggedResource(kBufferTypeExposure, exposure, ctx.viewport->id, true, inputs, numInputs);
+                getTaggedResource(kBufferTypeExposure, exposure, data.frame, ctx.viewport->id, true, inputs, numInputs);
 
                 if ((ctx.viewport->consts.structVersion >= sl::kStructVersion2 && ctx.viewport->consts.useAutoExposure) || !exposure)
                 {
@@ -413,10 +415,10 @@ Result dlssBeginEvent(chi::CommandList pCmdList, const common::EventData& data, 
                 CommonResource depth{};
                 CommonResource mvec{};
 
-                SL_CHECK(getTaggedResource(kBufferTypeScalingInputColor, colorIn, ctx.viewport->id, false, inputs, numInputs));
-                SL_CHECK(getTaggedResource(kBufferTypeScalingOutputColor, colorOut, ctx.viewport->id, false, inputs, numInputs));
-                SL_CHECK(getTaggedResource(kBufferTypeDepth, depth, ctx.viewport->id, false, inputs, numInputs));
-                SL_CHECK(getTaggedResource(kBufferTypeMotionVectors, mvec, ctx.viewport->id, false, inputs, numInputs));
+                SL_CHECK(getTaggedResource(kBufferTypeScalingInputColor, colorIn, data.frame, ctx.viewport->id, false, inputs, numInputs));
+                SL_CHECK(getTaggedResource(kBufferTypeScalingOutputColor, colorOut, data.frame, ctx.viewport->id, false, inputs, numInputs));
+                SL_CHECK(getTaggedResource(kBufferTypeDepth, depth, data.frame, ctx.viewport->id, false, inputs, numInputs));
+                SL_CHECK(getTaggedResource(kBufferTypeMotionVectors, mvec, data.frame, ctx.viewport->id, false, inputs, numInputs));
 
                 auto colorInExt = colorIn.getExtent();
                 auto colorOutExt = colorOut.getExtent();
@@ -467,7 +469,7 @@ Result dlssBeginEvent(chi::CommandList pCmdList, const common::EventData& data, 
                 ctx.ngxContext->params->Set(NVSDK_NGX_Parameter_PerfQualityValue, perfQualityValue);
                 ctx.ngxContext->params->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, dlssCreateFlags);
                 ctx.ngxContext->params->Set(NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, 1);
-                if (ctx.ngxContext->createFeature(pCmdList, NVSDK_NGX_Feature_SuperSampling, &viewport.handle, "sl.dlss"))
+                if (ctx.ngxContext->createFeature(pCmdList, NVSDK_NGX_Feature_SuperSampling, &viewport.handle, api::getPluginName()))
                 {
                     SL_LOG_INFO("Created DLSSContext feature (%u,%u)(optimal) -> (%u,%u) for viewport %u", viewport.settings.optimalRenderWidth, viewport.settings.optimalRenderHeight, viewport.consts.outputWidth, viewport.consts.outputHeight, data.id);
                     // Log the extent information for easier debugging
@@ -475,6 +477,10 @@ Result dlssBeginEvent(chi::CommandList pCmdList, const common::EventData& data, 
                     SL_LOG_INFO("DLSSContext color_out extents (%u,%u,%u,%u)", colorOutExt.left, colorOutExt.top, colorOutExt.width, colorOutExt.height);
                     SL_LOG_INFO("DLSSContext depth extents (%u,%u,%u,%u)", depthExt.left, depthExt.top, depthExt.width, depthExt.height);
                     SL_LOG_INFO("DLSSContext mvec extents (%u,%u,%u,%u)", mvecExt.left, mvecExt.top, mvecExt.width, mvecExt.height);
+                }
+                else
+                {
+                    return Result::eErrorNGXFailed;
                 }
             }
         }
@@ -505,19 +511,19 @@ Result dlssEndEvent(chi::CommandList pCmdList, const common::EventData& data, co
             CommonResource particleMask{};
 
             // Mandatory
-            SL_CHECK(getTaggedResource(kBufferTypeScalingInputColor, colorIn, ctx.viewport->id, false, inputs, numInputs));
-            SL_CHECK(getTaggedResource(kBufferTypeScalingOutputColor, colorOut, ctx.viewport->id, false, inputs, numInputs));
-            SL_CHECK(getTaggedResource(kBufferTypeDepth, depth, ctx.viewport->id, false, inputs, numInputs));
-            SL_CHECK(getTaggedResource(kBufferTypeMotionVectors, mvec, ctx.viewport->id, false, inputs, numInputs));
+            SL_CHECK(getTaggedResource(kBufferTypeScalingInputColor, colorIn, data.frame, ctx.viewport->id, false, inputs, numInputs));
+            SL_CHECK(getTaggedResource(kBufferTypeScalingOutputColor, colorOut, data.frame, ctx.viewport->id, false, inputs, numInputs));
+            SL_CHECK(getTaggedResource(kBufferTypeDepth, depth, data.frame, ctx.viewport->id, false, inputs, numInputs));
+            SL_CHECK(getTaggedResource(kBufferTypeMotionVectors, mvec, data.frame, ctx.viewport->id, false, inputs, numInputs));
 
             // Optional
-            getTaggedResource(kBufferTypeTransparencyHint, transparency, ctx.viewport->id, true, inputs, numInputs);
-            getTaggedResource(kBufferTypeExposure, exposure, ctx.viewport->id, true, inputs, numInputs);
-            getTaggedResource(kBufferTypeAnimatedTextureHint, animTexture, ctx.viewport->id, true, inputs, numInputs);
-            getTaggedResource(kBufferTypeReflectionMotionVectors, mvecReflections, ctx.viewport->id, true, inputs, numInputs);
-            getTaggedResource(kBufferTypeRaytracingDistance, rayTraceDist, ctx.viewport->id, true, inputs, numInputs);
-            getTaggedResource(kBufferTypeBiasCurrentColorHint, currentColorBias, ctx.viewport->id, true, inputs, numInputs);
-            getTaggedResource(kBufferTypeParticleHint, particleMask, ctx.viewport->id, true, inputs, numInputs);
+            getTaggedResource(kBufferTypeTransparencyHint, transparency, data.frame, ctx.viewport->id, true, inputs, numInputs);
+            getTaggedResource(kBufferTypeExposure, exposure, data.frame, ctx.viewport->id, true, inputs, numInputs);
+            getTaggedResource(kBufferTypeAnimatedTextureHint, animTexture, data.frame, ctx.viewport->id, true, inputs, numInputs);
+            getTaggedResource(kBufferTypeReflectionMotionVectors, mvecReflections, data.frame, ctx.viewport->id, true, inputs, numInputs);
+            getTaggedResource(kBufferTypeRaytracingDistance, rayTraceDist, data.frame, ctx.viewport->id, true, inputs, numInputs);
+            getTaggedResource(kBufferTypeBiasCurrentColorHint, currentColorBias, data.frame, ctx.viewport->id, true, inputs, numInputs);
+            getTaggedResource(kBufferTypeParticleHint, particleMask, data.frame, ctx.viewport->id, true, inputs, numInputs);
 
             if (!depth || !mvec || !colorIn || !colorOut)
             {
@@ -532,32 +538,6 @@ Result dlssEndEvent(chi::CommandList pCmdList, const common::EventData& data, co
             sl::Extent transparencyExt = transparency.getExtent();
             sl::Extent currentColorBiasExt = currentColorBias.getExtent();
 
-#ifdef SL_CAPTURE
-
-            // Capture
-            if (extra::keyboard::getInterface()->wasKeyPressed("capture")) ctx.capture->startRecording("DLSSContext");
-
-            if (ctx.capture->getIsCapturing()) {
-                double time = ctx.capture->getTimeSinceStart();
-                int captureIndex = ctx.capture->getCaptureIndex();
-
-                ctx.capture->appendGlobalConstantDump(captureIndex, time, consts);
-
-                const std::vector<int> dlssStructureSizes = std::vector<int>{ sizeof(sl::DLSSOptions) , sizeof(sl::DLSSOptimalSettings)};
-                ctx.capture->appendFeatureStructureDump(captureIndex, 0, &ctx.viewport->consts, dlssStructureSizes[0]);
-                ctx.capture->appendFeatureStructureDump(captureIndex, 1, &ctx.viewport->settings, dlssStructureSizes[1]);
-
-                ctx.capture->dumpResource(captureIndex, kBufferTypeScalingInputColor,    colorInExt, pCmdList,   colorIn );
-                ctx.capture->dumpResource(captureIndex, kBufferTypeDepth            ,    depthExt  , pCmdList,   depth   );
-                ctx.capture->dumpResource(captureIndex, kBufferTypeMotionVectors             ,    mvecExt   , pCmdList,   mvec    );
-
-                ctx.capture->incrementCaptureIndex();
-
-            }
-
-            if (ctx.capture->getIndexHasReachedMaxCapatureIndex()) ctx.capture->dumpPending();
-#endif
-
             /*chi::ResourceDescription desc[4];
             ctx.compute->getResourceDescription(depth, desc[0]);
             ctx.compute->getResourceDescription(mvec, desc[1]);
@@ -568,7 +548,7 @@ Result dlssEndEvent(chi::CommandList pCmdList, const common::EventData& data, co
             auto mvecIn = mvec;
 
 #if SL_ENABLE_TIMING
-            CHI_VALIDATE(ctx.compute->beginPerfSection(pCmdList, "sl.dlss"));
+            CHI_VALIDATE(ctx.compute->beginPerfSection(pCmdList, SL_RESOURCE_NAME("perf.evaluate").c_str()));
 #endif
 
             {
@@ -615,9 +595,9 @@ Result dlssEndEvent(chi::CommandList pCmdList, const common::EventData& data, co
                     }
                     if (!ctx.viewport->mvec)
                     {
-                        ctx.compute->beginVRAMSegment("sl.dlss");
+                        ctx.compute->beginVRAMSegment(api::getPluginName());
                         sl::chi::ResourceDescription desc(renderWidth, renderHeight, sl::chi::eFormatRG16F,sl::chi::HeapType::eHeapTypeDefault, sl::chi::ResourceState::eTextureRead);
-                        CHI_VALIDATE(ctx.compute->createTexture2D(desc, ctx.viewport->mvec, "sl.dlss.mvec"));
+                        CHI_VALIDATE(ctx.compute->createTexture2D(desc, ctx.viewport->mvec, SL_RESOURCE_NAME("tex2d.mvec").c_str()));
                         ctx.cacheState(ctx.viewport->mvec);
                         ctx.compute->endVRAMSegment();
                     }
@@ -673,8 +653,8 @@ Result dlssEndEvent(chi::CommandList pCmdList, const common::EventData& data, co
 
                 if (!ctx.viewport->output)
                 {
-                    ctx.compute->beginVRAMSegment("sl.dlss");
-                    ctx.compute->cloneResource(colorOut, ctx.viewport->output, "sl.dlss.output-cached", chi::ResourceState::eStorageRW);
+                    ctx.compute->beginVRAMSegment(api::getPluginName());
+                    ctx.compute->cloneResource(colorOut, ctx.viewport->output, SL_RESOURCE_NAME("clone.output-cached").c_str(), chi::ResourceState::eStorageRW);
                     ctx.cacheState(ctx.viewport->output);
                     ctx.compute->endVRAMSegment();
                 }
@@ -705,7 +685,6 @@ Result dlssEndEvent(chi::CommandList pCmdList, const common::EventData& data, co
                     ctx.ngxContext->params->Set(NVSDK_NGX_Parameter_MV_Scale_Y, (mvecPixelSpace ? 1.0f : (float)(consts->mvecScale.y * renderHeight)));
                     ctx.ngxContext->params->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, consts->jitterOffset.x);
                     ctx.ngxContext->params->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, consts->jitterOffset.y);
-                    ctx.ngxContext->params->Set(NVSDK_NGX_Parameter_Sharpness, ctx.viewport->consts.sharpness);
                     ctx.ngxContext->params->Set(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, ctx.viewport->consts.preExposure);
                     ctx.ngxContext->params->Set(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, ctx.viewport->consts.exposureScale);
                     ctx.ngxContext->params->Set(NVSDK_NGX_Parameter_Sharpness, ctx.viewport->consts.sharpness);
@@ -756,7 +735,7 @@ Result dlssEndEvent(chi::CommandList pCmdList, const common::EventData& data, co
                     ctx.ngxContext->params->Set(NVSDK_NGX_Parameter_DLSS_Indicator_Invert_X_Axis, ctx.viewport->consts.indicatorInvertAxisX);
                     ctx.ngxContext->params->Set(NVSDK_NGX_Parameter_DLSS_Indicator_Invert_Y_Axis, ctx.viewport->consts.indicatorInvertAxisY);
 
-                    ctx.ngxContext->evaluateFeature(pCmdList, ctx.viewport->handle, "sl.dlss");
+                    ctx.ngxContext->evaluateFeature(pCmdList, ctx.viewport->handle, api::getPluginName());
 
 #if 0
                     {
@@ -775,20 +754,20 @@ Result dlssEndEvent(chi::CommandList pCmdList, const common::EventData& data, co
 
                 float ms = 0;
 #if SL_ENABLE_TIMING
-                CHI_VALIDATE(ctx.compute->endPerfSection(pCmdList, "sl.dlss", ms));
+                CHI_VALIDATE(ctx.compute->endPerfSection(pCmdList, SL_RESOURCE_NAME("perf.evaluate").c_str(), ms));
 #endif
 
 #ifndef SL_PRODUCTION
                 /*static std::string s_stats;
                 auto v = api::getContext()->pluginVersion;
                 
-                s_stats = extra::format("sl.dlss {} - NGX {} - ({}x{})->({}x{}) - {}ms", v.toStr() + "." + GIT_LAST_COMMIT_SHORT, ctx.ngxVersion,
+                s_stats = extra::format("{} {} - NGX {} - ({}x{})->({}x{}) - {}ms", api::getPluginName(), v.toStr() + "." + GIT_LAST_COMMIT_SHORT, ctx.ngxVersion,
                     renderWidth, renderHeight, ctx.viewport->consts.outputWidth, ctx.viewport->consts.outputHeight, ms);
                 parameters->set(sl::param::dlss::kStats, (void*)s_stats.c_str());*/
 
                 {
                     uint64_t bytes;
-                    ctx.compute->getAllocatedBytes(bytes, "sl.dlss");
+                    ctx.compute->getAllocatedBytes(bytes, api::getPluginName());
                     std::scoped_lock lock(ctx.uiStats.mtx);
                     ctx.uiStats.mode = getDLSSModeAsStr(ctx.viewport->consts.mode);
                     ctx.uiStats.viewport = extra::format("Viewport {}x{} -> {}x{}", renderWidth, renderHeight, ctx.viewport->consts.outputWidth, ctx.viewport->consts.outputHeight);
@@ -863,6 +842,11 @@ Result slGetData(const BaseStructure *inputs, BaseStructure *output, CommandBuff
         ctx.ngxContext->params->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Height, &settings->renderHeightMax);
         ctx.ngxContext->params->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width, &settings->renderWidthMin);
         ctx.ngxContext->params->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height, &settings->renderHeightMin);
+        if (settings->optimalRenderWidth == 0 || settings->optimalRenderHeight == 0)
+        {
+            SL_LOG_WARN("DLSSContext 'getOptimalSettings' returns invalid size (%d x %d), due to unsupported mode or output size", settings->optimalRenderWidth, settings->optimalRenderHeight);
+            return Result::eErrorInvalidParameter;
+        }
     }
     
     // Stats
@@ -907,7 +891,7 @@ Result slFreeResources(Feature feature, const sl::ViewportHandle& viewport)
         if (instance.handle)
         {
             SL_LOG_INFO("Releasing DLSSContext instance id %u", viewport);
-            ctx.ngxContext->releaseFeature(instance.handle, "sl.dlss");
+            ctx.ngxContext->releaseFeature(instance.handle, api::getPluginName());
             // OK to release null resources
             CHI_VALIDATE(ctx.compute->destroyResource(instance.mvec));
             CHI_VALIDATE(ctx.compute->destroyResource(instance.output));
@@ -970,11 +954,6 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
 
     param::getPointerParam(parameters, sl::param::common::kComputeAPI, &ctx.compute);
 
-#ifdef SL_CAPTURE
-    extra::keyboard::getInterface()->registerKey("capture", extra::keyboard::VirtKey('U', true, true));
-    param::getPointerParam(parameters, sl::param::common::kCaptureAPI, &ctx.capture);
-#endif
-
     {
         json& config = *(json*)api::getContext()->loaderConfig;
         int appId = 0;
@@ -1026,7 +1005,7 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
                     ctx.uiStats.mode = "Mode: Off";
                     ctx.uiStats.viewport = ctx.uiStats.runtime = {};
                 }
-                if (ui->collapsingHeader(extra::format("sl.dlss v{}", (v.toStr() + "." + GIT_LAST_COMMIT_SHORT)).c_str(), imgui::kTreeNodeFlagDefaultOpen))
+                if (ui->collapsingHeader(extra::format("{} v{}", api::getPluginName(), (v.toStr() + "." + GIT_LAST_COMMIT_SHORT)).c_str(), imgui::kTreeNodeFlagDefaultOpen))
                 {
                     ui->text("NGX v%s ", ctx.ngxVersion.c_str());
                     ui->text(ctx.uiStats.mode.c_str());
@@ -1060,7 +1039,7 @@ void slOnPluginShutdown()
 
     for(auto v : ctx.viewports)
     {
-        ctx.ngxContext->releaseFeature(v.second.handle, "sl.dlss");
+        ctx.ngxContext->releaseFeature(v.second.handle, api::getPluginName());
         CHI_VALIDATE(ctx.compute->destroyResource(v.second.mvec));
     }
     CHI_VALIDATE(ctx.compute->destroyKernel(ctx.mvecKernel));

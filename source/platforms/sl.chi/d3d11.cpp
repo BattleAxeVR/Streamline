@@ -21,9 +21,11 @@
 */
 
 #include <d3d11_4.h>
+#include <system_error>
 #include <wrl/client.h>
 
 #include "source/core/sl.log/log.h"
+#include "source/core/sl.param/parameters.h"
 #include "source/platforms/sl.chi/d3d11.h"
 #include "nvapi.h"
 #include "_artifacts/shaders/copy_cs.h"
@@ -37,6 +39,13 @@ D3D11 s_d3d11;
 ICompute *getD3D11()
 {
     return &s_d3d11;
+}
+
+WaitStatus D3D11::waitCPUFence(Fence fence, uint64_t syncValue)
+{
+    assert(false);
+    SL_LOG_ERROR("Not implemented");
+    return WaitStatus::eError;
 }
 
 struct D3D11CommandListContext : public ICommandListContext
@@ -65,7 +74,7 @@ struct D3D11CommandListContext : public ICommandListContext
             }
             else
             {
-                m_compute->createFence(eFenceFlagsShared, m_syncValue, m_fence, "sl.dlssg.d3d11.fence");
+                m_compute->createFence(eFenceFlagsShared, m_syncValue, m_fence, (std::string(debugName) + ".fence").c_str());
             }
         }
     }
@@ -91,13 +100,6 @@ struct D3D11CommandListContext : public ICommandListContext
             return false;
         }
         return true;
-    }
-
-    WaitStatus waitCPUFence(Fence fence, uint64_t syncValue)
-    {
-        assert(false);
-        SL_LOG_ERROR("Not implemented");
-        return WaitStatus::eError;
     }
 
     void waitGPUFence(Fence fence, uint64_t syncValue, const DebugInfo &debugInfo) override
@@ -244,15 +246,22 @@ struct D3D11CommandListContext : public ICommandListContext
     {
         BOOL fullscreen = FALSE;
         ((IDXGISwapChain*)chain)->GetFullscreenState(&fullscreen, nullptr);
-        if (fullscreen || sync)
+        // DXGI_PRESENT_ALLOW_TEARING requires DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING on the
+        // swap chain — without it Present returns DXGI_ERROR_INVALID_CALL. Gate the OR
+        // on the actual capability so this layer is robust even if the proxy is created
+        // without tearing for any reason.
+        DXGI_SWAP_CHAIN_DESC desc{};
+        ((IDXGISwapChain*)chain)->GetDesc(&desc);
+        const bool tearingCapable = (desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+        if (fullscreen || sync || !tearingCapable)
         {
             flags &= ~DXGI_PRESENT_ALLOW_TEARING;
         }
-        else if (sync == 0)
+        else
         {
             flags |= DXGI_PRESENT_ALLOW_TEARING;
         }
-        
+
         HRESULT res{};
         if (params)
         {
@@ -266,13 +275,6 @@ struct D3D11CommandListContext : public ICommandListContext
     }
 
     void getFrameStats(SwapChain chain, void* frameStats)
-    {
-        assert(false);
-        SL_LOG_ERROR("Not implemented");
-        return;
-    }
-
-    void getLastPresentID(SwapChain chain, uint32_t& id)
     {
         assert(false);
         SL_LOG_ERROR("Not implemented");
@@ -460,6 +462,9 @@ ComputeStatus D3D11::init(Device InDevice, param::IParameters* params)
 
 ComputeStatus D3D11::shutdown()
 {
+    CHI_CHECK(destroyKernel(m_copyKernel));
+    m_copyKernel = {};
+
     m_context = {};
     SL_SAFE_RELEASE(m_immediateContext);
     SL_SAFE_RELEASE(m_device5);
@@ -482,20 +487,14 @@ ComputeStatus D3D11::shutdown()
 
     clearCache();
 
-    ComputeStatus Res = ComputeStatus::eOk;
     for (auto& k : m_kernels)
     {
         auto kernel = (KernelDataD3D11*)k.second;
-        for(auto& cb : kernel->constBuffers)
-        { 
-            SL_SAFE_RELEASE(cb.second);
-        }
-        kernel->constBuffers.clear();
-
         SL_LOG_VERBOSE("Destroying kernel %s", kernel->name.c_str());
-        SL_SAFE_RELEASE(kernel->shader);
+        kernel->destroy();
         delete kernel;
     }
+    m_kernels.clear();
 
     return Generic::shutdown();
 }
@@ -570,11 +569,13 @@ ComputeStatus D3D11::createKernel(void *blobData, unsigned int blobSize, const c
         {
             data = new KernelDataD3D11;
             data->hash = hash;
+            data->refcounter.store(1);
             m_kernels[hash] = data;
         }
         else
         {
             data = (KernelDataD3D11*)(*it).second;
+            data->refcounter.fetch_add(1);
         }
     }
     if (missing)
@@ -621,11 +622,20 @@ ComputeStatus D3D11::destroyKernel(Kernel& InKernel)
     {
         return ComputeStatus::eInvalidCall;
     }
-    KernelDataD3D11* data = (KernelDataD3D11*)(it->second);
-    SL_LOG_VERBOSE("Destroying kernel %s", data->name.c_str());
-    delete it->second;
-    m_kernels.erase(it);
-    InKernel = {};
+    KernelDataD3D11* kernel = (KernelDataD3D11*)(it->second);
+    auto prev_count = kernel->refcounter.fetch_sub(1);
+    if (prev_count == 1)  // Was 1 before decrement, now 0
+    {
+        SL_LOG_VERBOSE("Destroying kernel %s", kernel->name.c_str());
+        kernel->destroy();
+        delete it->second;
+        m_kernels.erase(it);
+        InKernel = {};
+    }
+    else
+    {
+        SL_LOG_VERBOSE("Destroying kernel %s doesn't really happen since other contexts still refer to it. Decreasing refcounter to %d", kernel->name.c_str(), kernel->refcounter.load());
+    }
     return ComputeStatus::eOk;
 }
 
@@ -687,7 +697,7 @@ ComputeStatus D3D11::popState(CommandList cmdList)
     return ComputeStatus::eOk;
 }
 
-ComputeStatus D3D11::createCommandListContext(CommandQueue queue, uint32_t count, ICommandListContext*& ctx, const char friendlyName[])
+ComputeStatus D3D11::createCommandListContext(ChiCommandQueue* queue, uint32_t count, ICommandListContext*& ctx, const char friendlyName[])
 {
     auto ctx1 = new D3D11CommandListContext();
     ctx1->init(friendlyName, m_device, this);
@@ -705,14 +715,17 @@ ComputeStatus D3D11::destroyCommandListContext(ICommandListContext* ctx)
     return ComputeStatus::eOk;
 }
 
-ComputeStatus D3D11::createCommandQueue(CommandQueueType type, CommandQueue& queue, const char friendlyName[], uint32_t index)
+ComputeStatus D3D11::createCommandQueue(CommandQueueType type,
+                                        ChiCommandQueue*& queue,
+                                        const char friendlyName[],
+                                        uint32_t index)
 {    
-    queue = m_immediateContext;
+    queue = (ChiCommandQueue *)m_immediateContext;
     m_immediateContext->AddRef();
     return ComputeStatus::eOk;
 }
 
-ComputeStatus D3D11::destroyCommandQueue(CommandQueue& queue)
+ComputeStatus D3D11::destroyCommandQueue(ChiCommandQueue* queue)
 {
     if (queue)
     {
@@ -747,73 +760,18 @@ ComputeStatus D3D11::setFullscreenState(SwapChain chain, bool fullscreen, Output
 {
     if (!chain) return ComputeStatus::eInvalidArgument;
     IDXGISwapChain* swapChain = (IDXGISwapChain*)chain;
-    if (FAILED(swapChain->SetFullscreenState(fullscreen, (IDXGIOutput*)out)))
+    HRESULT hr = swapChain->SetFullscreenState(fullscreen, (IDXGIOutput*)out);
+    if (FAILED(hr))
     {
-        SL_LOG_ERROR( "Failed to set fullscreen state");
+        // Host frame from the Reflex present marker; 0 when the app sends none.
+        uint32_t hostFrame{};
+        m_parameters->get(sl::param::latency::kMarkerPresentFrame, &hostFrame);
+        SL_LOG_ERROR("Internal call to native IDXGISwapChain::SetFullscreenState failed for swap chain %p "
+                     "(requested state: %s, output: %p, HRESULT 0x%08X: %s, host frame %u).",
+                     swapChain, fullscreen ? "fullscreen" : "windowed", out,
+                     static_cast<uint32_t>(hr), std::system_category().message(hr).c_str(), hostFrame);
     }
     return ComputeStatus::eOk;
-}
-
-ComputeStatus D3D11::getRefreshRate(SwapChain chain, float& refreshRate)
-{
-    if (!chain) return ComputeStatus::eInvalidArgument;
-    IDXGISwapChain* swapChain = (IDXGISwapChain*)chain;
-    IDXGIOutput* dxgiOutput;
-    HRESULT hr = swapChain->GetContainingOutput(&dxgiOutput);
-    // if swap chain get failed to get DXGIoutput then follow the below link get the details from remarks section
-    //https://docs.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiswapchain-getcontainingoutput
-    if (SUCCEEDED(hr))
-    {
-        // get the descriptor for current output
-        // from which associated mornitor will be fetched
-        DXGI_OUTPUT_DESC outputDes{};
-        hr = dxgiOutput->GetDesc(&outputDes);
-        dxgiOutput->Release();
-        if (SUCCEEDED(hr))
-        {
-            MONITORINFOEXW info;
-            info.cbSize = sizeof(info);
-            // get the associated monitor info
-            if (GetMonitorInfoW(outputDes.Monitor, &info) != 0)
-            {
-                // using the CCD get the associated path and display configuration
-                UINT32 requiredPaths, requiredModes;
-                if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &requiredPaths, &requiredModes) == ERROR_SUCCESS)
-                {
-                    std::vector<DISPLAYCONFIG_PATH_INFO> paths(requiredPaths);
-                    std::vector<DISPLAYCONFIG_MODE_INFO> modes2(requiredModes);
-                    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &requiredPaths, paths.data(), &requiredModes, modes2.data(), nullptr) == ERROR_SUCCESS)
-                    {
-                        // iterate through all the paths until find the exact source to match
-                        for (auto& p : paths) {
-                            DISPLAYCONFIG_SOURCE_DEVICE_NAME sourceName;
-                            sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-                            sourceName.header.size = sizeof(sourceName);
-                            sourceName.header.adapterId = p.sourceInfo.adapterId;
-                            sourceName.header.id = p.sourceInfo.id;
-                            if (DisplayConfigGetDeviceInfo(&sourceName.header) == ERROR_SUCCESS)
-                            {
-                                // find the matched device which is associated with current device 
-                                // there may be the possibility that display may be duplicated and windows may be one of them in such scenario
-                                // there may be two callback because source is same target will be different
-                                // as window is on both the display so either selecting either one is ok
-                                if (wcscmp(info.szDevice, sourceName.viewGdiDeviceName) == 0) {
-                                    // get the refresh rate
-                                    UINT numerator = p.targetInfo.refreshRate.Numerator;
-                                    UINT denominator = p.targetInfo.refreshRate.Denominator;
-                                    double refrate = (double)numerator / (double)denominator;
-                                    refreshRate = (float)refrate;
-                                    return ComputeStatus::eOk;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    SL_LOG_ERROR( "Failed to retreive refresh rate from swapchain 0x%llx", chain);
-    return ComputeStatus::eError;
 }
 
 ComputeStatus D3D11::getSwapChainBuffer(SwapChain chain, uint32_t index, Resource& buffer)
@@ -884,7 +842,7 @@ ComputeStatus D3D11::bindConsts(uint32_t pos, uint32_t base, void *data, size_t 
         desc.height = 1;
         desc.heapType = eHeapTypeUpload;
         desc.state = ResourceState::eConstantBuffer;
-        createBuffer(desc, buffer, "sl.d3d11.const_buffer");
+        createBuffer(desc, buffer, SL_COMPOSE_NAME(kComputeTag, "buf.const-d3d11").c_str());
         ctx.kernel->constBuffers[base] = (ID3D11Buffer*)(buffer->native);
     }
     auto buffer = ctx.kernel->constBuffers[base];
@@ -984,8 +942,8 @@ ComputeStatus D3D11::getTextureDriverData(Resource res, ResourceDriverDataD3D11&
             SL_LOG_ERROR( "CreateShaderResourceView failed - status %d", status);
             return ComputeStatus::eError;
         }
-        constexpr char SRVFriendlyName[] = "sl.compute.textureCachedSRV";
-        data.SRV->SetPrivateData(WKPDID_D3DDebugObjectName, sizeof(SRVFriendlyName), SRVFriendlyName); // Narrow character type debug object name
+        auto srvName = SL_COMPOSE_NAME(kComputeTag, "srv.texture-cached");
+        data.SRV->SetPrivateData(WKPDID_D3DDebugObjectName, (DWORD)(srvName.size() + 1), srvName.c_str());
 
         SL_LOG_VERBOSE("Cached SRV resource 0x%llx node %u fmt %s size (%u,%u)", res, 0, getDXGIFormatStr(Desc.nativeFormat), (UINT)Desc.width, (UINT)Desc.height);
 
@@ -1044,8 +1002,8 @@ ComputeStatus D3D11::getSurfaceDriverData(Resource res, ResourceDriverDataD3D11&
             return ComputeStatus::eError;
         }
 
-        constexpr char UAVFriendlyName[] = "sl.compute.surfaceCachedUAV";
-        data.UAV->SetPrivateData(WKPDID_D3DDebugObjectName, sizeof(UAVFriendlyName), UAVFriendlyName); // Narrow character type debug object name
+        auto uavName = SL_COMPOSE_NAME(kComputeTag, "uav.surface-cached");
+        data.UAV->SetPrivateData(WKPDID_D3DDebugObjectName, (DWORD)(uavName.size() + 1), uavName.c_str());
 
         SL_LOG_VERBOSE("Cached UAV resource 0x%llx node %u fmt %s size (%u,%u)", res, 0, getDXGIFormatStr(Desc.nativeFormat), (UINT)Desc.width, (UINT)Desc.height);
 
@@ -1246,7 +1204,6 @@ ComputeStatus D3D11::createBufferResourceImpl(ResourceDescription &InOutResource
 
 ComputeStatus D3D11::setDebugName(Resource res, const char name[])
 {
-#ifdef SL_DEBUG
     auto unknown = (IUnknown*)(res->native);
     ID3D11DeviceChild* deviceChild{};
     unknown->QueryInterface(&deviceChild);
@@ -1255,7 +1212,6 @@ ComputeStatus D3D11::setDebugName(Resource res, const char name[])
         deviceChild->Release();
         deviceChild->SetPrivateData(WKPDID_D3DDebugObjectName, (UINT)strlen(name), name);
     }
-#endif
     return ComputeStatus::eOk;
 }
 
@@ -1430,6 +1386,7 @@ ComputeStatus D3D11::cloneResource(Resource resource, Resource &clone, const cha
     clone->width = desc.width;
     clone->height = desc.height;
 
+    setDebugName(clone, friendlyName);
     manageVRAM(clone, VRAMOperation::eAlloc);
 
     return ComputeStatus::eOk;
@@ -1672,20 +1629,12 @@ ComputeStatus D3D11::endPerfSection(CommandList cmdList, const char* key, float 
     return ComputeStatus::eOk;
 }
 
-ComputeStatus D3D11::beginProfiling(CommandList cmdList, unsigned int Metadata, const char* marker)
+ bool D3D11::signalCPUFence(Fence fence, uint64_t syncValue)
 {
-#if SL_ENABLE_PROFILING
-#endif
-    return ComputeStatus::eError;
+    assert(false);
+    SL_LOG_ERROR("Not implemented");
+    return false;
 }
-
-ComputeStatus D3D11::endProfiling(CommandList cmdList)
-{
-#if SL_ENABLE_PROFILING
-#endif
-    return ComputeStatus::eError;
-}
-
 
 int D3D11::destroyResourceDeferredImpl(const Resource resource)
 {
@@ -1734,7 +1683,7 @@ DXGI_FORMAT D3D11::getCorrectFormat(DXGI_FORMAT Format)
             return Format;
     };
 }
-ComputeStatus D3D11::notifyOutOfBandCommandQueue(CommandQueue queue, OutOfBandCommandQueueType type)
+ComputeStatus D3D11::notifyOutOfBandCommandQueue(ChiCommandQueue* queue, OutOfBandCommandQueueType type)
 {
     return ComputeStatus::eOk;
 }
@@ -1813,7 +1762,7 @@ ComputeStatus D3D11::getResourceFromSharedHandle(ResourceType type, Handle handl
             return ComputeStatus::eError;
         }
         resource = new sl::Resource(ResourceType::eTex2d, tex);
-        setDebugName(resource, "sl.shared.from.d3d12");
+        setDebugName(resource, SL_COMPOSE_NAME(kComputeTag, "tex2d.shared-from-d3d12").c_str());
         // We free these buffers but never allocate them so account for the VRAM
         manageVRAM(resource, VRAMOperation::eAlloc);
     }
@@ -1876,5 +1825,14 @@ ComputeStatus D3D11::prepareTranslatedResources(CommandList cmdList, const std::
     return ComputeStatus::eOk;
 }
 
+void KernelDataD3D11::destroy()
+{
+    for(auto& cb : constBuffers)
+    { 
+        SL_SAFE_RELEASE(cb.second);
+    }
+    constBuffers.clear();
+    SL_SAFE_RELEASE(shader);
+}
 }
 }

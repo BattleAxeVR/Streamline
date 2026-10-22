@@ -20,7 +20,6 @@
 * SOFTWARE.
 */
 
-#ifdef SL_WINDOWS
 #include <d3d11.h>
 #include "source/core/sl.interposer/d3d12/d3d12.h"
 #include "source/core/sl.interposer/d3d12/d3d12Device.h"
@@ -30,9 +29,6 @@
 #include "source/core/sl.interposer/dxgi/dxgiSwapchain.h"
 #include "external/vulkan/include/vulkan/vulkan.h"
 #include <versionhelpers.h>
-#else
-#include <unistd.h>
-#endif
 #include <chrono>
 
 #include "include/sl.h"
@@ -79,7 +75,6 @@ void ConfigureLogOverridesFromInterposerConfig(log::ILog* log)
 
 void ConfigureLogOverridesFromRegistry(log::ILog* log)
 {
-#ifdef SL_WINDOWS
     constexpr const wchar_t* kRegSubKey = L"SOFTWARE\\NVIDIA Corporation\\Global\\Streamline";
     constexpr const wchar_t* kEnableConsoleValue = L"EnableConsoleLogging";
     constexpr const wchar_t* kLogLevelValue = L"LogLevel";
@@ -116,7 +111,6 @@ void ConfigureLogOverridesFromRegistry(log::ILog* log)
     {
         SL_LOG_HINT("Overriding logging settings from registry keys");
     }
-#endif
 }
 
 void ConfigureLogOverridesFromEnvironment(log::ILog* log)
@@ -177,36 +171,17 @@ inline sl::Result slValidateState()
     return sl::Result::eOk;
 }
 
-
 inline sl::Result slValidateFeatureContext(sl::Feature f, const sl::plugin_manager::FeatureContext*& ctx)
 {
     ctx = plugin_manager::getInterface()->getFeatureContext(f);
-    std::string jsonConfig{};
-    if (!ctx || !plugin_manager::getInterface()->getExternalFeatureConfig(f, jsonConfig))
+    if (!ctx)
     {
-        SL_LOG_ERROR("'%s' is missing.", getFeatureAsStr(f));
+        SL_LOG_ERROR("'%s' context is missing.", getFeatureAsStr(f));
         return Result::eErrorFeatureMissing;
     }
-    // Any JSON parser can be used here
-    std::istringstream stream(jsonConfig);
-    nlohmann::json extCfg;
-    stream >> extCfg;
-    if (extCfg.contains("/feature/supported"_json_pointer) && !extCfg["feature"]["supported"])
-    {
-        SL_LOG_ERROR("'%s' is not supported.", getFeatureAsStr(f));
-        return Result::eErrorFeatureNotSupported;
-    }
-    return Result::eOk;
+    sl::Result featureSupported = plugin_manager::getInterface()->getFeatureSupportedExternalConfig(f);
+    return featureSupported;
 }
-
-struct FrameHandleImplementation : public FrameToken
-{
-    FrameHandleImplementation() {};
-
-    virtual operator uint32_t() const override final { return counter.load(); };
-
-    std::atomic<uint32_t> counter{};
-};
 
 struct APIContext
 {
@@ -215,7 +190,7 @@ struct APIContext
     uint32_t frameHandleIndex = 0;
     FrameHandleImplementation frameHandles[MAX_FRAMES_IN_FLIGHT];
 
-    std::map<Feature, std::pair<size_t, BufferType*>> requiredTags;
+    std::map<Feature, std::vector<BufferType>> requiredTags;
     std::map<Feature, std::pair<size_t, char**>> vkInstanceExtensions;
     std::map<Feature, std::pair<size_t, char**>> vkDeviceExtensions;
     std::map<Feature, std::pair<size_t, char**>> vkFeatures12;
@@ -266,31 +241,20 @@ sl::Result slInit(const Preferences &pref, uint64_t sdkVersion)
                 if (config.waitForDebugger)
                 {
                     SL_LOG_INFO("Waiting for debugger to attach ...");
-#ifdef SL_WINDOWS
                     while (!IsDebuggerPresent())
                     {
                         std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     }
-#endif
                 }
             }
 #endif
 
             // Check to see if RenderDoc is present and notify the user
-#ifdef SL_WINDOWS
             HMODULE renderDocMod = GetModuleHandleA("renderdoc.dll");
             if (renderDocMod)
             {
                 SL_LOG_WARN("RenderDoc has been detected.  As RenderDoc disables NVAPI, any plugins which require NVAPI will be disabled.");
             }
-#endif
-#ifdef SL_LINUX
-            void* renderDocMod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
-            if (renderDocMod)
-            {
-                SL_LOG_WARN("RenderDoc has been detected.  As RenderDoc disables NVAPI, any plugins which require NVAPI will be disabled.");
-            }
-#endif
 
             auto manager = plugin_manager::getInterface();
             if (manager->isInitialized())
@@ -382,7 +346,8 @@ Result slSetFeatureLoaded(sl::Feature feature, bool enabled)
     SL_EXCEPTION_HANDLE_END_RETURN(Result::eErrorExceptionHandler);
 }
 
-Result slSetTag(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags, sl::CommandBuffer* cmdBuffer)
+Result slSetTagCommon(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags,
+    sl::CommandBuffer* cmdBuffer, bool useResourceTaggingForFrame, const sl::FrameToken& frame = FrameHandleImplementation{})
 {
     //! IMPORTANT:
     //! 
@@ -391,15 +356,41 @@ Result slSetTag(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags,
     //! added in a new structure which is then chained. This assert ensures
     //! that new element(s) are NOT added in the middle of a structure.
     static_assert(offsetof(sl::ResourceTag, extent) == 48, "new elements can only be added at the end of each structure");
-    static_assert(offsetof(sl::Resource, reserved) == 104, "new elements can only be added at the end of each structure");
+    static_assert(offsetof(sl::Resource, internalFlags) == 104, "new elements can only be added at the end of each structure");
+    static_assert(offsetof(sl::Resource, reserved) == 106, "new elements can only be added at the end of each structure");
 
     SL_EXCEPTION_HANDLE_START;
     SL_CHECK(slValidateState());
     const sl::plugin_manager::FeatureContext* ctx;
     SL_CHECK(slValidateFeatureContext(kFeatureCommon, ctx));
     if (!tags || numTags == 0) return Result::eErrorInvalidParameter;
-    return ctx->setTag(viewport, tags, numTags, cmdBuffer);
+    return (useResourceTaggingForFrame ? ctx->setTagForFrame(frame, viewport, tags, numTags, cmdBuffer)
+        : ctx->setTag(viewport, tags, numTags, cmdBuffer));
     SL_EXCEPTION_HANDLE_END_RETURN(Result::eErrorExceptionHandler);
+}
+
+Result slSetTag(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags, sl::CommandBuffer* cmdBuffer)
+{
+    if (plugin_manager::getInterface()->getPreferences().flags & PreferenceFlags::eUseFrameBasedResourceTagging)
+    {
+        SL_LOG_ERROR("'PreferenceFlag::eUseFrameBasedResourceTagging' flag is specified in sl::Preferences but slSetTagForFrame API is not called!");
+        return Result::eErrorInvalidIntegration;
+    }
+    SL_LOG_WARN_ONCE("slSetTag API has now been deprecated. Please consider using frame-based version slSetTagForFrame API and setting flag \
+sl::PreferenceFlags flag eUseResourceTaggingForFrame for the same!");
+
+    return slSetTagCommon(viewport, tags, numTags, cmdBuffer, false);
+}
+
+Result slSetTagForFrame(const sl::FrameToken& frame, const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags, sl::CommandBuffer* cmdBuffer)
+{
+    if ((plugin_manager::getInterface()->getPreferences().flags & PreferenceFlags::eUseFrameBasedResourceTagging) == 0)
+    {
+        SL_LOG_ERROR("'slSetTagForFrame' SL API is called but 'PreferenceFlag::eUseFrameBasedResourceTagging' flag is not set!");
+        return Result::eErrorInvalidIntegration;
+    }
+
+    return slSetTagCommon(viewport, tags, numTags, cmdBuffer, true, frame);
 }
 
 Result slSetConstants(const Constants& values, const FrameToken& frame, const ViewportHandle& viewport)
@@ -621,7 +612,6 @@ Result slUpgradeInterface(void** baseInterface)
     {
         SL_CHECK(slValidateState());
 
-#if SL_WINDOWS
         if (!baseInterface || !*baseInterface)
         {
             SL_LOG_ERROR( "Missing input interface");
@@ -722,9 +712,6 @@ Result slUpgradeInterface(void** baseInterface)
         }
 
         SL_LOG_ERROR( "Unable to upgrade unsupported interface");
-#else
-        SL_LOG_ERROR("This method is not supported on Linux");
-#endif
 
         return Result::eErrorUnsupportedInterface;
     };
@@ -753,15 +740,17 @@ Result slIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapterI
         //! 
         SL_CHECK(slValidateState());
 
-        auto ctx = plugin_manager::getInterface()->getFeatureContext(feature);
         std::string jsonConfig{};
-        if (!ctx || !plugin_manager::getInterface()->getExternalFeatureConfig(feature, jsonConfig))
+        if (!plugin_manager::getInterface()->getExternalFeatureConfig(feature, jsonConfig))
         {
             return Result::eErrorFeatureMissing;
         }
 
+        // Obtain feature context only when needed. If not available, try to derive
+        // the most informative error from the parsed configuration.
+        auto ctx = plugin_manager::getInterface()->getFeatureContext(feature);
         // Check if the feature is supported on any available adapters
-        if (!ctx->supportedAdapters)
+        if (ctx && !ctx->supportedAdapters)
         {
             return Result::eErrorNoSupportedAdapterFound;
         }
@@ -771,6 +760,31 @@ Result slIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapterI
         nlohmann::json cfg;
         stream >> cfg;
 
+        // Check adapter support first before checking HWS requirements
+        // This works even when ctx is nullptr (plugin failed to load)
+        if (cfg.contains("adapters"))
+        {
+            bool anyAdapterSupported = false;
+            
+            // Check if any adapter supports the feature
+            // Default assumption: adapters support the feature unless explicitly marked as unsupported
+            for (auto& [adapterName, adapterConfig] : cfg["adapters"].items())
+            {
+                if (!adapterConfig.contains("supported") || adapterConfig["supported"].get<bool>())
+                {
+                    anyAdapterSupported = true;
+                    break; // At least one adapter supports it
+                }
+            }
+            
+            // If no adapters support the feature, return early - don't bother checking HWS
+            if (!anyAdapterSupported)
+            {
+                return Result::eErrorNoSupportedAdapterFound;
+            }
+        }
+
+        // Now check HWS requirements only if adapter architecture is supported
         if (cfg.contains("hws"))
         {
             bool required = cfg["hws"]["required"];
@@ -825,6 +839,17 @@ Result slIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapterI
             default:
                 SL_LOG_ERROR("Unexpected renderAPI value passed to slInit!");
                 return Result::eErrorInvalidParameter;
+        }
+
+        // If feature context is missing we can still infer support status from JSON
+        if (!ctx)
+        {
+            // If config explicitly marks feature unsupported for platform/plugin-specific reasons
+            if (cfg.contains("/feature/supported"_json_pointer) && !cfg["feature"]["supported"]) 
+            {
+                return Result::eErrorFeatureNotSupported;
+            }
+            return Result::eErrorFeatureMissing;
         }
 
         // Not having 'isSupported' function indicates that plugin is supported on all adapters by design.
@@ -959,16 +984,11 @@ Result slGetFeatureRequirements(sl::Feature feature, sl::FeatureRequirements& re
             if (it == s_ctx.requiredTags.end())
             {
                 std::vector<uint32_t> tags = cfg["feature"]["tags"];
-                auto list = new BufferType[tags.size()];
-                for (size_t i = 0; i < tags.size(); i++)
-                {
-                    list[i] = (BufferType)tags[i];
-                }
-                s_ctx.requiredTags[feature] = { tags.size(), list };
+                s_ctx.requiredTags[feature] = tags;
             }
             auto& data = s_ctx.requiredTags[feature];
-            requirements.requiredTags = data.second;
-            requirements.numRequiredTags = (uint32_t)data.first;
+            requirements.requiredTags = data.data();
+            requirements.numRequiredTags = (uint32_t)data.size();
         }
 
         // VK bits

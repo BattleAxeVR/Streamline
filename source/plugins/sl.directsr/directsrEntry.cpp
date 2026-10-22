@@ -319,9 +319,9 @@ sl::Result directsrBegin(chi::CommandList pCmdList, const common::EventData &dat
     CommonResource colorOut{};
     CommonResource colorIn{};
     CommonResource depth{};
-    SL_CHECK(getTaggedResource(kBufferTypeScalingOutputColor, colorOut, data.id, false, inputs, numInputs));
-    SL_CHECK(getTaggedResource(kBufferTypeScalingInputColor, colorIn, data.id, false, inputs, numInputs));
-    SL_CHECK(getTaggedResource(kBufferTypeDepth, depth, data.id, false, inputs, numInputs));
+    SL_CHECK(getTaggedResource(kBufferTypeScalingOutputColor, colorOut, data.frame, data.id, false, inputs, numInputs));
+    SL_CHECK(getTaggedResource(kBufferTypeScalingInputColor, colorIn, data.frame, data.id, false, inputs, numInputs));
+    SL_CHECK(getTaggedResource(kBufferTypeDepth, depth, data.frame, data.id, false, inputs, numInputs));
 
     return viewport->prepareUpscalerEngine(commonConsts->motionVectorsJittered == Boolean::eTrue,
                                            ((ID3D12Resource*)(void*)colorOut)->GetDesc().Format,
@@ -355,10 +355,10 @@ sl::Result directsrEnd(chi::CommandList pCmdList, const common::EventData &data,
     CommonResource colorIn{};
     CommonResource depth{};
     CommonResource mvec{};
-    SL_CHECK(getTaggedResource(kBufferTypeScalingOutputColor, colorOut, data.id, false, inputs, numInputs));
-    SL_CHECK(getTaggedResource(kBufferTypeScalingInputColor, colorIn, data.id, false, inputs, numInputs));
-    SL_CHECK(getTaggedResource(kBufferTypeDepth, depth, data.id, false, inputs, numInputs));
-    SL_CHECK(getTaggedResource(kBufferTypeMotionVectors, mvec, data.id, false, inputs, numInputs));
+    SL_CHECK(getTaggedResource(kBufferTypeScalingOutputColor, colorOut, data.frame, data.id, false, inputs, numInputs));
+    SL_CHECK(getTaggedResource(kBufferTypeScalingInputColor, colorIn, data.frame, data.id, false, inputs, numInputs));
+    SL_CHECK(getTaggedResource(kBufferTypeDepth, depth, data.frame, data.id, false, inputs, numInputs));
+    SL_CHECK(getTaggedResource(kBufferTypeMotionVectors, mvec, data.frame, data.id, false, inputs, numInputs));
 
     uint32_t renderWidth = ((sl::Extent)colorIn).width;
     uint32_t renderHeight = ((sl::Extent)colorIn).height;
@@ -511,7 +511,7 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
 
         if (renderApi != sl::RenderAPI::eD3D12)
         {
-            SL_LOG_WARN("sl.directsr is only compatible with D3D12!");
+            SL_LOG_WARN("%s is only compatible with D3D12!", api::getPluginName());
             goto fail;
         }
     }
@@ -576,7 +576,7 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
 
 fail:
     freePluginGlobalState();
-    SL_LOG_WARN("sl.directsr failed");
+    SL_LOG_WARN("%s failed", api::getPluginName());
     return false;
 }
 

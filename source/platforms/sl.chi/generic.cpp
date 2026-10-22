@@ -20,11 +20,9 @@
 * SOFTWARE.
 */
 
-#if defined(SL_WINDOWS)
 #include <d3d12.h>
 #include <d3d11.h>
 #include <dxgi1_6.h>
-#endif // defined(SL_WINDOWS)
 #define __STDC_FORMAT_MACROS 1
 #include <cinttypes>
 #include <utility>
@@ -32,6 +30,7 @@
 #include <fstream>
 #include <map>
 #include <unordered_set>
+#include <vector>
 
 struct IDXGIAdapter;
 struct IDXGISwapChain;
@@ -41,6 +40,9 @@ struct IDXGISwapChain;
 #include "source/core/sl.extra/extra.h"
 #include "source/core/sl.param/parameters.h"
 #include "source/platforms/sl.chi/generic.h"
+#include "source/core/sl.security/secureLoadLibrary.h"
+#include "source/platforms/sl.chi/nvapiCompat.h"
+#include "external/nsight-sdk/SystemsGraphics/include/Impl/NGFX_Core.h"
 #include "nvapi.h"
 
 // {B5504F36-CB88-4B2D-AE64-9CAE29E23CA9}
@@ -75,6 +77,7 @@ const char *GFORMAT_STR[] = {
     "eFormatD32S32",
     "eFormatD24S8",
     "eFormatD32S8U",
+    "eFormatRGBA8SN",
 }; static_assert(countof(GFORMAT_STR) == sl::chi::eFormatCOUNT, "Not enough strings for eFormatCOUNT");
 
 #define SL_TEXT_BUFFER_SIZE 16384
@@ -85,6 +88,73 @@ namespace sl
 namespace chi
 {
 
+namespace
+{
+void* nsightSecureLoadLibraryCallback(const wchar_t* libName)
+{
+    auto handle{ static_cast<void*>(sl::security::loadLibrary(libName)) };
+    if (!handle)
+    {
+        SL_LOG_VERBOSE("NSight library load failed: %S", libName);
+    }
+    return handle;
+}
+}
+
+void Generic::initNsightActivity()
+{
+    NGFX_SetLibraryLoadFn(nsightSecureLoadLibraryCallback);
+
+    NGFX_ActivityType activity{};
+    const NGFX_Result detected{ NGFX_GetInjectedActivity(&activity) };
+    if (detected != NGFX_Result_Success)
+    {
+        SL_LOG_VERBOSE("NSight SDK activity not detected (%d)!", detected);
+        return;
+    }
+
+    if (!initNsightActivityImpl(activity))
+    {
+        SL_LOG_WARN("NSight SDK activity initialization failed (%d)!", activity);
+        return;
+    }
+
+    m_nsightInitialized = true;
+    SL_LOG_INFO("NSight SDK activity initialized successfully!");
+}
+
+ScopedProfilingSection::ScopedProfilingSection(ICompute* compute, CommandList cmdList, const char* function, sl::Feature feature)
+    : ScopedProfilingSection(compute, cmdList)
+{
+#if SL_ENABLE_PROFILING
+    std::stringstream str;
+    str << function << " " << getFeatureAsStr(feature);
+    m_compute->beginProfiling(m_cmdList, str.str().c_str());
+#endif
+}
+
+ ScopedProfilingSection::ScopedProfilingSection(ICompute* compute, CommandList cmdList, const char* function, const sl::ResourceTag* resources, uint32_t numResources) : ScopedProfilingSection(compute, cmdList)
+{
+#if SL_ENABLE_PROFILING
+    std::string marker;
+
+    std::stringstream str;
+    str << function << " ";
+
+    for (uint32_t i = 0; i < numResources; ++i)
+    {
+        str << getBufferTypeAsStr(resources[i].type);
+        
+        if (i + 1 != numResources)
+        {
+            str << ", ";
+        }
+    }
+    m_compute->beginProfiling(m_cmdList, str.str().c_str());
+    #endif
+}
+
+
 #define SL_DEBUG_RESOURCE_POOL 0
 
 struct ResourcePool : IResourcePool
@@ -93,9 +163,8 @@ struct ResourcePool : IResourcePool
 
     ResourcePool(ICompute* compute, const char* vramSegment) : m_compute(compute), m_vramSegment(vramSegment) {};
 
-    virtual void setMaxQueueSize(size_t maxSize) override final
+    virtual void setMaxQueueSize(size_t) override final
     {
-        m_maxQueueSize = maxSize;
     }
 
     virtual HashedResource allocate(Resource source, const char* debugName, ResourceState initialState) override final
@@ -107,77 +176,39 @@ struct ResourcePool : IResourcePool
         std::unique_lock<std::mutex> lock(m_mtx);
         // Look for a free one to recycle
         HashedResource resource{};
+        auto& freeItems = m_free[hash];
+        if (!freeItems.empty())
         {
-            auto& freeItems = m_free[hash];
-            // Incoming resource was allocated and freed before but nothing is free at the moment
-            if (freeItems.empty())
-            {
-                // No free items, check if this was allocated before
-                for (auto& allocated : m_allocated)
-                {
-                    if (hash == allocated.first)
-                    {
-                        // Yes, this was allocated before so it makes sense to wait for an item to be freed
-
-                        // Figure out how much VRAM is available vs how much we need
-                        uint64_t bytesAvailable;
-                        m_compute->getVRAMBudget(bytesAvailable);
-                        ResourceFootprint footprint{};
-                        m_compute->getResourceFootprint(source, footprint);
-
-                        //! IMPORTANT: The more we wait the less VRAM we use but we potentially slow down execution.
-                        //! 
-                        //! Therefore we determine dynamically how much VRAM is available and if we need to wait more (100ms) or less (0.5ms).
-                        //! In addition, we have to check for hard limit on the queue size since even if there is plenty of VRAM it does not 
-                        //! make sense to allocate buffers endlessly. Good example would be the v-sync on mode, in that scenario the longer 
-                        //! waits are normal since present calls will block and wait for the v-sync line before actually presenting the frame.
-                        float resourcePoolWaitUs = bytesAvailable > footprint.totalBytes && allocated.second.size() < m_maxQueueSize ? 500.0f : 100000.0f;
-
-                        // Use more precise timer
-                        extra::AverageValueMeter meter;
-                        meter.begin();
-                        // Prevent deadlocks, time out after a reasonable wait period.
-                        // See comments above about the wait time and VRAM consumption.
-                        while (freeItems.empty() && meter.getElapsedTimeUs() < resourcePoolWaitUs)
-                        {
-                            lock.unlock();
-                            // Better than sleep for modern CPUs with hyper-threading
-                            YieldProcessor();
-                            lock.lock();
-                            meter.end();
-                        }
-                        // Timing out here is fine, that just means more VRAM is needed.
-                        //
-                        // We already have warnings/errors for GPU fence and worker thread timeouts which are serious problems
-                    }
-                }
-            }
-            if (!freeItems.empty())
-            {
-                resource = freeItems.back().second;
-                freeItems.pop_back();
-                m_compute->getResourceState((Resource)resource, resource.accessState());
-                m_allocated[hash].push_back({ std::chrono::system_clock::now(), resource });
-                return resource;
-            }
-        }
-        if (!resource)
-        {
-            m_compute->beginVRAMSegment(m_vramSegment.c_str());
-            Resource res{};
-            m_compute->cloneResource(source, res, debugName, initialState);
-            m_compute->endVRAMSegment();
-            m_compute->getResourceState(res->state, initialState);
-            resource = HashedResource(hash, initialState, res, m_compute, true);
-#if SL_DEBUG_RESOURCE_POOL
-            for (auto& [timestamp, cached] : m_allocated[hash])
-            {
-                assert(res != cached.resource);
-            }
-            SL_LOG_VERBOSE("alloc - hash %llu 0x%p '%s' [%llu,%llu]\n", hash, ((Resource)resource)->native, debugName, m_allocated[hash].size(), m_free[hash].size());
-#endif
+            resource = freeItems.back().second;
+            freeItems.pop_back();
+            m_compute->getResourceState((Resource)resource, resource.accessState());
             m_allocated[hash].push_back({ std::chrono::system_clock::now(), resource });
+            return resource;
         }
+        // No free items available, allocate a new resource.
+        // This is safe because all GPU work using previously recycled resources
+        // was submitted on the same command queue earlier, so it is guaranteed
+        // to complete before any new work referencing the newly allocated resource.
+        // collectGarbage() will reclaim unused pool entries to keep VRAM in check.
+        m_compute->beginVRAMSegment(m_vramSegment.c_str());
+        Resource res{};
+        auto status = m_compute->cloneResource(source, res, debugName, initialState);
+        m_compute->endVRAMSegment();
+        if (status != ComputeStatus::eOk || !res)
+        {
+            SL_LOG_ERROR("Failed to clone resource '%s' for hash %llu", debugName, hash);
+            return HashedResource{};
+        }
+        m_compute->getResourceState(res->state, initialState);
+        resource = HashedResource(hash, initialState, res, m_compute, true);
+#if SL_DEBUG_RESOURCE_POOL
+        for (auto& [timestamp, cached] : m_allocated[hash])
+        {
+            assert(res != cached.resource);
+        }
+        SL_LOG_VERBOSE("alloc - hash %llu 0x%p '%s' [%llu,%llu]\n", hash, ((Resource)resource)->native, debugName, m_allocated[hash].size(), m_free[hash].size());
+#endif
+        m_allocated[hash].push_back({ std::chrono::system_clock::now(), resource });
         return resource;
     }
 
@@ -274,8 +305,6 @@ struct ResourcePool : IResourcePool
     };
 
     std::mutex m_mtx{};
-    //! Some basic default, must be set to a reasonable value based on the use-case
-    std::atomic<size_t> m_maxQueueSize = 2; 
     ICompute* m_compute{};
     std::string m_vramSegment{};
     std::map<uint64_t, std::vector<TimestampedResource>> m_free{};
@@ -296,6 +325,7 @@ ComputeStatus Generic::init(Device device, param::IParameters* params)
     m_parameters = params;
     m_typelessDevice = device;
     params->get(sl::param::global::kPreferenceFlags, (uint64_t*)&m_preferenceFlags);
+    m_cachedReflexSyncParams.version = NV_SET_REFLEX_SYNC_PARAMS_VER1;
     return ComputeStatus::eOk;
 }
 
@@ -311,6 +341,17 @@ ComputeStatus Generic::shutdown()
             ((IUnknown*)cachedResource.second)->Release();
         }
         m_resourceTrackMap.clear();
+
+        for (auto& frameResourceMap : m_frameResourceTrackingMap)
+        {
+            for (auto& cachedResource : frameResourceMap.second)
+            {
+                ((IUnknown*)cachedResource.second)->Release();
+                cachedResource.second = nullptr;
+            }
+            frameResourceMap.second.clear();
+        }
+        m_frameResourceTrackingMap.clear();
     }
 
     CHI_CHECK(collectGarbage(UINT_MAX));
@@ -385,6 +426,28 @@ ComputeStatus Generic::startTrackingResource(uint64_t uid, Resource resource)
     return ComputeStatus::eOk;
 }
 
+ComputeStatus Generic::startTrackingResource(uint32_t frameId, uint64_t uid, Resource resource)
+{
+    if (resource != nullptr && resource->native != nullptr)
+    {
+        // Make sure we are thread safe
+        std::scoped_lock lock(m_mutexResourceTrack);
+        
+        // NOTE: This covers d3d11/d3d12, VK currently does NOP here
+        auto cachedResource = (IUnknown*)(resource->native);
+        auto refCount = cachedResource->AddRef();
+        m_frameResourceTrackingMap[frameId][uid] = cachedResource;
+
+        // frames must be deleted from this map, otherwise it would grow infinitely
+        constexpr uint32_t InsaneNumberOfFramesInFlight = 30;
+        assert(m_frameResourceTrackingMap.size() < InsaneNumberOfFramesInFlight);
+        //std::wstring name = getDebugName(cachedResource);
+        //SL_LOG_VERBOSE("Start tracking 0x%llx '%S' ref count %d", cachedResource, name.c_str(), refCount);
+    }
+
+    return ComputeStatus::eOk;
+}
+
 ComputeStatus Generic::stopTrackingResource(uint64_t id, Resource dbgResource)
 {
     // Make sure we are thread safe
@@ -401,6 +464,40 @@ ComputeStatus Generic::stopTrackingResource(uint64_t id, Resource dbgResource)
         cachedResource->Release();
         m_resourceTrackMap.erase(it);
     }
+    return ComputeStatus::eOk;
+}
+
+ComputeStatus Generic::stopTrackingResource(uint32_t frameId, uint64_t id, Resource dbgResource)
+{
+    // Make sure we are thread safe
+    std::scoped_lock lock(m_mutexResourceTrack);
+
+    IUnknown* cachedResource{};
+    std::map<uint32_t, ResourceTrackingMap>::const_iterator frameMapIt{};
+    ResourceTrackingMap::const_iterator resourceMapIt{};
+    if (frameMapIt = m_frameResourceTrackingMap.find(frameId); frameMapIt != m_frameResourceTrackingMap.end())
+    {
+        if (resourceMapIt = m_frameResourceTrackingMap[frameId].find(id); resourceMapIt != m_frameResourceTrackingMap[frameId].end())
+        {
+            cachedResource = m_frameResourceTrackingMap[frameId][id];
+        }
+    }
+
+    if (cachedResource != nullptr)
+    {
+        assert(cachedResource == dbgResource->native ||
+            dbgResource->native == nullptr); // startTracking() and stopTracking() is called for different resources?
+        // Note that here we could easily hold last reference and that is fine, host destroys tag and calls setTag(null)
+        // NOTE: This covers d3d11/d3d12, VK currently does NOP here
+        cachedResource->Release();
+        cachedResource = m_frameResourceTrackingMap[frameId][id] = nullptr;
+        m_frameResourceTrackingMap[frameId].erase(resourceMapIt);
+        if (m_frameResourceTrackingMap[frameId].empty())
+        {
+            m_frameResourceTrackingMap.erase(frameMapIt);
+        }
+    }
+
     return ComputeStatus::eOk;
 }
 
@@ -664,7 +761,27 @@ ComputeStatus Generic::createBuffer(const ResourceDescription& CreateResourceDes
     {
         ResourceDesc.sName = InFriendlyName;
     }
-    CHI_CHECK(createBufferResourceImpl(ResourceDesc, OutResource, ResourceDesc.state, InFriendlyName));
+    
+    // Determine default buffer state if not explicitly provided
+    ResourceState state = ResourceDesc.state;
+    if (state == ResourceState::eUnknown)
+    {
+        switch (ResourceDesc.heapType)
+        {
+            case eHeapTypeUpload:
+                state = ResourceState::eGenericRead;
+                break;
+            case eHeapTypeReadback:
+                state = ResourceState::eCopyDestination;
+                break;
+            case eHeapTypeDefault:
+                // Buffers in default heap should start in Common state (D3D12) or General (Vulkan)
+                state = ResourceState::eGeneral;
+                break;
+        }
+    }
+    
+    CHI_CHECK(createBufferResourceImpl(ResourceDesc, OutResource, state, InFriendlyName));
 
     manageVRAM(OutResource, VRAMOperation::eAlloc);
 
@@ -701,7 +818,26 @@ ComputeStatus Generic::createTexture2DResourceShared(const ResourceDescription& 
     {
         resourceDesc.sName = InFriendlyName;
     }
-    CHI_CHECK(createTexture2DResourceSharedImpl(resourceDesc, OutResource, UseNativeFormat, resourceDesc.state, InFriendlyName));
+    
+    // Determine default texture state if not explicitly provided
+    ResourceState state = resourceDesc.state;
+    if (state == ResourceState::eUnknown)
+    {
+        switch (resourceDesc.heapType)
+        {
+            case eHeapTypeUpload:
+                state = ResourceState::eGenericRead;
+                break;
+            case eHeapTypeReadback:
+                state = ResourceState::eCopyDestination;
+                break;
+            case eHeapTypeDefault:
+                state = ResourceState::eCopyDestination;
+                break;
+        }
+    }
+    
+    CHI_CHECK(createTexture2DResourceSharedImpl(resourceDesc, OutResource, UseNativeFormat, state, InFriendlyName));
 
     manageVRAM(OutResource, VRAMOperation::eAlloc);
 
@@ -730,11 +866,10 @@ ComputeStatus Generic::destroyResource(Resource resource, uint32_t frameDelay)
         manageVRAM(resource, VRAMOperation::eFree);
     }
 
-    if (m_releaseCallback && bufferOrTex2d)
+    // Skip the host release callback for Vulkan swapchain images: they were never allocated by the
+    // host callback, and they need destroyResourceDeferredImpl to clean up the internally-created VkImageView.
+    if (m_releaseCallback && bufferOrTex2d && !(resource->internalFlags & sl::Resource::eVulkanSwapChainImage))
     {
-        //NOTE: We never destroy resources created by the host, only internal ones.
-
-        // This allows host to destroy VK memory etc.
         m_releaseCallback(resource, m_typelessDevice);
         delete resource;
     }
@@ -775,28 +910,36 @@ ComputeStatus Generic::collectGarbage(uint32_t finishedFrame)
         m_finishedFrame.store(finishedFrame);
     }
 
-    std::lock_guard<std::mutex> lock(m_mutexResource);
-
+    // A destroy task can call into external code which then re-enters CHI to
+    // schedule destruction. Snapshot the ready tasks while holding the queue
+    // lock, then invoke them after releasing the lock. Work scheduled by a
+    // task is deliberately deferred until the next collectGarbage call.
+    std::vector<TimestampedLambda> readyTasks;
     {
+        std::lock_guard<std::mutex> lock(m_mutexResource);
         auto it = m_destroyWithLambdas.begin();
         while (it != m_destroyWithLambdas.end())
         {
-            auto& tres = (*it);
-            // Run lambda is
-            if (finishedFrame > (tres.frame + tres.frameDelay))
+            if (finishedFrame > (it->frame + it->frameDelay))
             {
-                SL_LOG_VERBOSE("Calling destroy lambda - scheduled at frame %u - finished frame %u - forced %s", tres.frame, m_finishedFrame.load(), finishedFrame != UINT_MAX ? "no" : "yes");
-                tres.task();
+                readyTasks.push_back(std::move(*it));
                 it = m_destroyWithLambdas.erase(it);
             }
             else
             {
-                it++;
+                ++it;
             }
         }
     }
 
+    for (auto& item : readyTasks)
     {
+        SL_LOG_VERBOSE("Calling destroy lambda - scheduled at frame %u - finished frame %u - forced %s", item.frame, m_finishedFrame.load(), finishedFrame != UINT_MAX ? "no" : "yes");
+        item.task();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutexResource);
         auto it = m_resourcesToDestroy.begin();
         while (it != m_resourcesToDestroy.end())
         {
@@ -879,7 +1022,8 @@ ComputeStatus Generic::getBytesPerPixel(Format InFormat, size_t& size)
         8,                      // eFormatRG32UI,
         8,                      // eFormatD32S32,
         4,                      // eFormatD24S8,
-        8,                      // eFormatD32S8U 
+        8,                      // eFormatD32S8U,
+        sizeof(uint32_t),       // eFormatRGBA8SN,
     }; static_assert(countof(BYTES_PER_PIXEL_TABLE) == eFormatCOUNT, "Not enough numbers for eFormatCOUNT");
 
     size = BYTES_PER_PIXEL_TABLE[InFormat];
@@ -945,6 +1089,7 @@ ComputeStatus Generic::getNativeFormat(Format format, NativeFormat& native)
         case eFormatRG8UN: native = DXGI_FORMAT_R8G8_UNORM; break;
         case eFormatRGB10A2UN: native = DXGI_FORMAT_R10G10B10A2_UNORM; break;
         case eFormatRGBA8UN: native = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+        case eFormatRGBA8SN: native = DXGI_FORMAT_R8G8B8A8_SNORM; break;
         case eFormatBGRA8UN: native = DXGI_FORMAT_B8G8R8A8_UNORM; break;
         case eFormatRGBA32F: native = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
         case eFormatRGB32F:  native = DXGI_FORMAT_R32G32B32_FLOAT; break;
@@ -1000,6 +1145,8 @@ ComputeStatus Generic::getFormat(NativeFormat nativeFmt, Format& format)
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_R8G8B8A8_TYPELESS:
         format = eFormatRGBA8UN; break;
+    case DXGI_FORMAT_R8G8B8A8_SNORM:
+        format = eFormatRGBA8SN; break;
     case DXGI_FORMAT_R32G32B32A32_FLOAT:
     case DXGI_FORMAT_R32G32B32A32_TYPELESS:
         format = eFormatRGBA32F; break;
@@ -1061,6 +1208,7 @@ ComputeStatus Generic::getFormatAsString(const Format format, std::string& name)
         RETURN_STR(eFormatRG8UN);
         RETURN_STR(eFormatRGB10A2UN);
         RETURN_STR(eFormatRGBA8UN);
+        RETURN_STR(eFormatRGBA8SN);
         RETURN_STR(eFormatBGRA8UN);
         RETURN_STR(eFormatRGBA32F);
         RETURN_STR(eFormatRGB32F);
@@ -1135,13 +1283,53 @@ ComputeStatus Generic::getSleepStatus(ReflexState& settings)
     return ComputeStatus::eOk;
 }
 
+ComputeStatus Generic::getFrameGenParams(uint8_t& outFgMultiplier, bool& outDfgControl)
+{
+    NV_GET_SLEEP_STATUS_PARAMS_V1_BFM_37870595 params{};
+    compile_time_assert(sizeof(NV_GET_SLEEP_STATUS_PARAMS_V1_BFM_37870595) == sizeof(NV_GET_SLEEP_STATUS_PARAMS_V1));
+    params.version = NV_GET_SLEEP_STATUS_PARAMS_VER;
+    NVAPI_CHECK(NvAPI_D3D_GetSleepStatus((IUnknown*)m_typelessDevice, (NV_GET_SLEEP_STATUS_PARAMS*)&params));
+    outFgMultiplier = params.fgMultiplier;
+    outDfgControl = params.bDfgControl != 0;
+    return ComputeStatus::eOk;
+}
+
+//TODO: Remove this binary compatible struct once we update the NVAPI headers.
+typedef struct
+{
+    NvU32  version;
+    struct FrameReport {
+        NvU64 frameID;
+        NvU64 inputSampleTime;
+        NvU64 simStartTime;
+        NvU64 simEndTime;
+        NvU64 renderSubmitStartTime;
+        NvU64 renderSubmitEndTime;
+        NvU64 presentStartTime;
+        NvU64 presentEndTime;
+        NvU64 driverStartTime;
+        NvU64 driverEndTime;
+        NvU64 osRenderQueueStartTime;
+        NvU64 osRenderQueueEndTime;
+        NvU64 gpuRenderStartTime;
+        NvU64 gpuRenderEndTime;
+        NvU32 gpuActiveRenderTimeUs;
+        NvU32 gpuFrameTimeUs;
+        NvU64 cameraConstructedTime;    // New
+        NvU32 crossAdapterCopyTimeUs;   // New
+        NvU8  rsvd[108];                // [120]->[108]
+    } frameReport[64];
+    NvU8  rsvd[32];
+} NV_LATENCY_RESULT_PARAMS_V1_BFM_36495674;
+
 ComputeStatus Generic::getLatencyReport(ReflexState& settings)
 {
-    NV_LATENCY_RESULT_PARAMS params = {};
+    NV_LATENCY_RESULT_PARAMS_V1_BFM_36495674 params = {};
+    compile_time_assert(sizeof(NV_LATENCY_RESULT_PARAMS_V1_BFM_36495674) == sizeof(NV_LATENCY_RESULT_PARAMS_V1));
     params.version = NV_LATENCY_RESULT_PARAMS_VER1;
-    NVAPI_CHECK(NvAPI_D3D_GetLatency((IUnknown*)m_typelessDevice, &params));
+    NVAPI_CHECK(NvAPI_D3D_GetLatency((IUnknown*)m_typelessDevice, (NV_LATENCY_RESULT_PARAMS*)&params));
 
-    for (auto i = 0; i < 64; i++)
+    for (auto i = 0; i < kReflexFrameReportCount; i++)
     {
         settings.frameReport[i].frameID = params.frameReport[i].frameID;
         settings.frameReport[i].inputSampleTime = params.frameReport[i].inputSampleTime;
@@ -1159,6 +1347,12 @@ ComputeStatus Generic::getLatencyReport(ReflexState& settings)
         settings.frameReport[i].gpuRenderEndTime = params.frameReport[i].gpuRenderEndTime;
         settings.frameReport[i].gpuActiveRenderTimeUs = params.frameReport[i].gpuActiveRenderTimeUs;
         settings.frameReport[i].gpuFrameTimeUs = params.frameReport[i].gpuFrameTimeUs;
+
+        if (settings.structVersion >= kStructVersion2)
+        {
+            settings.frameReport2[i].cameraConstructedTime = params.frameReport[i].cameraConstructedTime;
+            settings.frameReport2[i].crossAdapterCopyTimeUs = params.frameReport[i].crossAdapterCopyTimeUs;
+        }
     }
 
     return ComputeStatus::eOk;
@@ -1177,6 +1371,36 @@ ComputeStatus Generic::setReflexMarker(PCLMarker marker, uint64_t frameId)
     params.frameID = frameId;
     params.markerType = (NV_LATENCY_MARKER_TYPE)marker;
     NVAPI_CHECK(NvAPI_D3D_SetLatencyMarker((IUnknown*)m_typelessDevice, &params));
+    return ComputeStatus::eOk;
+}
+
+ComputeStatus Generic::setReflexSync(bool enable, int32_t timeInQueueUs, uint32_t timeInQueueUsTarget, uint32_t vblankIntervalUs)
+{
+    std::unique_lock lock(m_mutexReflexSync);
+
+    m_cachedReflexSyncParams.bEnable = enable ? 1 : 0;
+    m_cachedReflexSyncParams.bDisable = enable ? 0 : 1;
+    m_cachedReflexSyncParams.timeInQueueUs = timeInQueueUs;
+    m_cachedReflexSyncParams.timeInQueueUsTarget = timeInQueueUsTarget;
+    m_cachedReflexSyncParams.vblankIntervalUs = vblankIntervalUs;
+
+    NVAPI_CHECK(NvAPI_D3D_SetReflexSync((IUnknown*)m_typelessDevice, (NV_SET_REFLEX_SYNC_PARAMS*)&m_cachedReflexSyncParams));
+
+    m_cachedReflexSyncParams.bEnable = 0;
+    m_cachedReflexSyncParams.bDisable = 0;
+
+    return ComputeStatus::eOk;
+}
+
+ComputeStatus Generic::setReflexSyncFG(uint8_t dfgMaxMultiplier, uint32_t dfgTargetFps, uint8_t fgMultiplier)
+{
+    std::unique_lock lock(m_mutexReflexSync);
+
+    m_cachedReflexSyncParams.fgMultiplier = fgMultiplier;
+    m_cachedReflexSyncParams.dfgMaxMultiplier = dfgMaxMultiplier;
+    m_cachedReflexSyncParams.dfgTargetFps = dfgTargetFps;
+
+    NVAPI_CHECK(NvAPI_D3D_SetReflexSync((IUnknown*)m_typelessDevice, (NV_SET_REFLEX_SYNC_PARAMS*)&m_cachedReflexSyncParams));
     return ComputeStatus::eOk;
 }
 
@@ -1261,6 +1485,134 @@ ComputeStatus Generic::fetchTranslatedResourceFromCache(ICompute* compute, Resou
         shared.clone = (*it).second.clone;
     }
     shared.source = resource;
+    return ComputeStatus::eOk;
+}
+
+ComputeStatus Generic::getRefreshRate(WindowHandle window, float& refreshRate)
+{
+    if (!window)
+    {
+        return ComputeStatus::eInvalidArgument;
+    }
+
+    HWND hwnd = (HWND)window;
+
+    // Make sure the window actually exists
+    if (!IsWindow(hwnd))
+    {
+        SL_LOG_ERROR("Window handle 0x%llx is not a valid window", window);
+        return ComputeStatus::eError;
+    }
+    
+    // Get the monitor that contains the window
+    HMONITOR hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!hMonitor)
+    {
+        SL_LOG_ERROR("Failed to get monitor from window handle 0x%llx", window);
+        return ComputeStatus::eError;
+    }
+
+    // Get monitor info
+    MONITORINFOEXW monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (!GetMonitorInfoW(hMonitor, &monitorInfo))
+    {
+        SL_LOG_ERROR("Failed to get monitor info for window handle 0x%llx", window);
+        return ComputeStatus::eError;
+    }
+
+    // Query display configuration for precise refresh rate
+    UINT32 pathCount, modeCount;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
+    {
+        SL_LOG_ERROR("Failed to get display config buffer sizes for window handle 0x%llx", window);
+        return ComputeStatus::eError;
+    }
+
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), 
+                           &modeCount, modes.data(), nullptr) != ERROR_SUCCESS)
+    {
+        SL_LOG_ERROR("Failed to query display config for window handle 0x%llx", window);
+        return ComputeStatus::eError;
+    }
+
+    // Find the path that matches our monitor
+    for (const auto& path : paths)
+    {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME sourceName = {};
+        sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        sourceName.header.size = sizeof(sourceName);
+        sourceName.header.adapterId = path.sourceInfo.adapterId;
+        sourceName.header.id = path.sourceInfo.id;
+
+        if (DisplayConfigGetDeviceInfo(&sourceName.header) != ERROR_SUCCESS)
+        {
+            continue;
+        }
+
+        if (wcscmp(monitorInfo.szDevice, sourceName.viewGdiDeviceName) != 0)
+        {
+            continue;
+        }
+
+        // Get precise refresh rate from rational number
+        // (numerator/denominator). Divide as double for maximum precision.
+        const DISPLAYCONFIG_RATIONAL& rationalRate = path.targetInfo.refreshRate;
+        refreshRate = (float)((double)rationalRate.Numerator / rationalRate.Denominator);
+        return ComputeStatus::eOk;
+    }
+
+    SL_LOG_ERROR("Failed to get refresh rate from window handle 0x%llx", window);
+    return ComputeStatus::eError;
+}
+
+ComputeStatus Generic::getDisplayId(WindowHandle window, uint32_t& displayId)
+{
+    displayId = 0;
+
+    if (!window)
+    {
+        return ComputeStatus::eInvalidArgument;
+    }
+
+    HWND hwnd = (HWND)window;
+
+    if (!IsWindow(hwnd))
+    {
+        SL_LOG_ERROR("Window handle 0x%llx is not a valid window", window);
+        return ComputeStatus::eError;
+    }
+
+    HMONITOR hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!hMonitor)
+    {
+        SL_LOG_ERROR("Failed to get monitor from window handle 0x%llx", window);
+        return ComputeStatus::eError;
+    }
+
+    MONITORINFOEXW monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (!GetMonitorInfoW(hMonitor, &monitorInfo))
+    {
+        SL_LOG_ERROR("Failed to get monitor info for window handle 0x%llx", window);
+        return ComputeStatus::eError;
+    }
+
+    char deviceNameA[CCHDEVICENAME];
+    WideCharToMultiByte(CP_ACP, 0, monitorInfo.szDevice, -1, deviceNameA, CCHDEVICENAME, nullptr, nullptr);
+
+    NvU32 nvDisplayId = 0;
+    NvAPI_Status status = NvAPI_DISP_GetDisplayIdByDisplayName(deviceNameA, &nvDisplayId);
+    if (status != NVAPI_OK)
+    {
+        SL_LOG_ERROR("NvAPI_DISP_GetDisplayIdByDisplayName failed for '%s' with status %d", deviceNameA, status);
+        return ComputeStatus::eError;
+    }
+
+    displayId = nvDisplayId;
     return ComputeStatus::eOk;
 }
 

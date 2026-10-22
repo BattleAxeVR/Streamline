@@ -2,7 +2,7 @@
 Streamline - Manual Hooking
 =======================
 
-Version 2.7.2
+Version 2.14.16
 =======
 
 The automated global hooking is a great way to quickly enable SL features in any application. However, this can lead to unnecessary overhead caused by the entire API redirection through SL proxies and problems with tools and 3rd party libraries which do not expect to receive SL proxies as inputs.
@@ -75,6 +75,18 @@ enum class FunctionHookID : uint32_t
 };
 ```
 
+> **WARNING:** Present invocation requirement in manual hooking
+>
+> When `PreferenceFlag::eUseManualHooking` is set, you must ensure the common plugin’s `presentCommon()` function is called every frame. Failing to invoke `presentCommon()` will lead to incorrect behavior and memory growth (especially across swapchain resizes).
+>
+> - Verification: set a breakpoint in the common plugin’s `presentCommon()` function. It should be hit consistently every frame. During window resize, confirm that it executes around the transition.
+
+> **If `presentCommon()` is not called:**
+> - Verify Streamline is initialized and enabled before any rendering begins.
+> - Route your frame presentation path to invoke the common plugin’s `presentCommon()` exactly once per frame. In manual hooking, the recommended approach is to call `slUpgradeInterface` immediately after creating the frame presentation interface (e.g., the swapchain on DirectX), so Streamline can integrate with your presentation path and invoke `presentCommon()`.
+> - If you have multiple presentation code paths (alternate backends/window modes), unify or fan-in so all active paths invoke `presentCommon()`.
+> - Re-run with a breakpoint in `presentCommon()` to confirm it executes every frame and around window resizes.
+
 ### 3.0 INITIALIZATION AND SHUTDOWN
 
 Call `slInit` **before any of the hooks mentioned in section [2.0](#20-manual-hooking-api) could be triggered** (like for example, DXGI calls to create swap-chain) and make sure to specify the special flag `PreferenceFlag::eUseManualHooking` as shown in the snippet below:
@@ -146,7 +158,7 @@ else
     //
     // This part is identical for D3D11 and D3D12    
     IDXGISwapChain* nativeSwapchain{};
-    if(SL_FAILED(result, slGetNativeInterface(proxySwapChain, &nativeSwapchain))
+    if(SL_FAILED(result, slGetNativeInterface(proxySwapChain, &nativeSwapchain)))
     {
         // Handle error, check logs
     }
@@ -452,13 +464,16 @@ else
 }
 ```
 
-Now that you have the information about the additional extensions, features and queues required by SL feature(s) you can proceed to create Vulkan instance and device. For more details please check out the [implementation on GitHub](https://github.com/NVIDIAGameWorks/Streamline/blob/main/source/core/sl.interposer/vulkan/wrapper.cpp#L234).
+> **NOTE:**
+> If the host application intends to view names of SL and NGX feature resources (e.g. DLSS textures and buffers) and SL and NGX profiling markers in tools such as Nsight, enable the `VK_EXT_debug_utils` instance extension on its `VkInstance` (in addition to the extensions reported by `slGetFeatureRequirements`).
+
+Now that you have the information about the additional extensions, features and queues required by SL feature(s) you can proceed to create Vulkan instance and device. For more details please check out the [implementation](../source/core/sl.interposer/vulkan/wrapper.cpp).
 
 Note that Vulkan supports optical flow feature extension from Nvidia natively, as required by DLSS-G, starting with VK_API_VERSION_1_1 (recommended version is VK_API_VERSION_1_3) and minimum Nvidia driver version 527.64 on Windows and 525.72 on Linux. Vulkan SDK version 1.3.231.0 supports validation layer for this extension.
 Native optical flow feature in Vulkan requires its own optical flow queue whose family is exclusive to graphics, compute and copy queue families and whose info is required to be passed during Vulkan device creation and has certain requirements for its use in DLSS-G:
 1. Native optical flow queue family cannot be the same as that of any of the other queues of its client.
 2. Its queue should be the very first one of the very first native optical flow-capable family resulting in the required queue index is 0.
-For more details, please check out the [helper getOpticalFlowQueueInfo on GitHub](https://github.com/NVIDIAGameWorks/Streamline/blob/main/source/platforms/sl.chi/vulkan.cpp) to retrieve the same as well as the implementation link referred above.
+For more details, please check out the [helper getOpticalFlowQueueInfo](../source/platforms/sl.chi/vulkan.cpp) to retrieve the same as well as the implementation link referred above.
 In the absence of this setup in manual hooking mode, DLSS-G runs optical flow in an interop mode.
 
 ##### 5.2.2 PROVIDING INSTANCE, DEVICE AND OTHER INFORMATION TO SL
@@ -498,7 +513,7 @@ When using D3D tagging is similar to the regular SL integrations with the except
 //
 sl::Resource mvec = { sl::ResourceType::Tex2d, mvecResource, nullptr, nullptr, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr };
 sl::ResourceTag mvecTag = sl::ResourceTag {&mvec, sl::kBufferTypeMvec, sl::ResourceLifecycle::eOnlyValidNow, &mvecExtent };
-slSetTag(viewport, &mvecTag, 1, cmdList);
+slSetTagForFrame(*currentFrame, viewport, &mvecTag, 1, cmdList);
 ```
 
 #### 6.2 Vulkan
@@ -513,7 +528,7 @@ When using Vulkan tagging is a bit more involved since host needs to provide add
 // Vulkan does not provide a way to obtain VkImage description so host must provide one.
 sl::Resource mvec = { sl::ResourceType::Tex2d, mvecImage, nullptr, mvecImageView, VK_IMAGE_LAYOUT_GENERAL , 1920, 1080, VK_FORMAT_R32G32_SFLOAT, 1, 1, 0, 0, VK_IMAGE_USAGE_STORAGE_BIT };
 sl::ResourceTag mvecTag = sl::ResourceTag {&mvec, sl::kBufferTypeMvec, sl::ResourceLifecycle::eOnlyValidNow, &mvecExtent };
-slSetTag(viewport, &mvecTag, 1, cmdList);
+slSetTagForFrame(*currentFrame, viewport, &mvecTag, 1, cmdList);
 ```
 
 > **IMPORTANT:**
@@ -593,4 +608,3 @@ void restorePipeline(VkCommandBuffer cmdBuffer)
 
 > **IMPORTANT:**
 > Failure to restore command list(buffer) state correctly will cause your application to crash or misbehave in some other form.
-

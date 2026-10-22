@@ -1,11 +1,12 @@
 
+
 Streamline - Reflex
 =======================
 
->The focus of this guide is on using Streamline to integrate Reflex into an application.  For more information about Reflex itself, please visit the [NVIDIA Developer Reflex Page][2].
+>The focus of this guide is on using Streamline to integrate Reflex into an application.  For more information about Reflex itself, please visit the [Reflex Github](https://github.com/NVIDIA-RTX/REFLEX) or [NVIDIA Developer Reflex Page][2].
 >For information on user interface considerations when using this plugin, please see the ["RTX UI Developer Guidelines.pdf"][1] document included with this SDK.
 
-Version 2.7.2
+Version 2.14.16
 =======
 
 Here is an overview list of sub-features in the Reflex plugin:
@@ -31,19 +32,22 @@ Call `slInit` as early as possible (before any dxgi/d3d11/d3d12 APIs are invoked
 sl::Preferences pref{};
 pref.showConsole = true; // for debugging, set to false in production
 pref.logLevel = sl::LogLevel::eDefault;
-pref.pathsToPlugins = {}; // change this if Streamline plugins are not located next to the executable
-pref.numPathsToPlugins = 0; // change this if Streamline plugins are not located next to the executable
+pref.pathsToPlugins = {};    // change this if Streamline plugins are not located next to the executable
+pref.numPathsToPlugins = 0;  // change this if Streamline plugins are not located next to the executable
 pref.pathToLogsAndData = {}; // change this to enable logging to a file
-pref.logMessageCallback = myLogMessageCallback; // highly recommended to track warning/error messages in your callback
-pref.applicationId = myId; // Provided by NVDA, required if using NGX components (DLSS 2/3)
-pref.engine = myEngine; // If using UE or Unity
+pref.logMessageCallback =
+    myLogMessageCallback;             // highly recommended to track warning/error messages in your callback
+pref.applicationId = myId;            // Provided by NVDA, required if using NGX components (DLSS 2/3)
+pref.engine = myEngine;               // If using UE or Unity
 pref.engineVersion = myEngineVersion; // Optional version
-pref.projectId = myProjectId; // Optional project id
-if(SL_FAILED(res, slInit(pref)))
+pref.projectId = myProjectId;         // Optional project id
+if (SL_FAILED(res, slInit(pref)))
 {
-	// Handle error, check the logs
-	if(res == sl::Result::eErrorDriverOutOfDate) { /* inform user */}
-	// and so on ...
+    // Handle error, check the logs
+    if (res == sl::Result::eErrorDriverOutOfDate)
+    { /* inform user */
+    }
+    // and so on ...
 }
 ```
 
@@ -92,10 +96,12 @@ if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&factory)))
                 // Requested feature is not supported on the system, fallback to the default method
                 switch (result)
                 {
-                    case sl::Result::eErrorOSOutOfDate:         // inform user to update OS
-                    case sl::Result::eErrorDriverOutOfDate:     // inform user to update driver
-                    case sl::Result::eErrorNoSupportedAdapter:  // cannot use this adapter (older or non-NVDA GPU etc)
-                    // and so on ...
+                    case sl::Result::eErrorOSOutOfDate:             // inform user to update OS
+                    case sl::Result::eErrorDriverOutOfDate:         // inform user to update driver
+                    case sl::Result::eErrorNoSupportedAdapterFound: // cannot use this adapter (older or non-NVDA
+                                                                    // GPU etc)
+                        break;
+                        // and so on ...
                 };
             }
             else
@@ -201,7 +207,7 @@ if(SL_FAILED(res, slReflexSleep(*currentFrame)))
 ```
 
 > **NOTE:**
-> See [Reflex SDK Integration Guide][2] for details on `slReflexSleep` placement
+> See [Reflex SDK Integration Guide][3] for details on `slReflexSleep` placement
 
 ### 6.0 PCL STATS
 
@@ -247,7 +253,7 @@ Reflex UI settings are disabled or not available on other IHV Hardware |
 
 **Steps**
 
-1. Locate Reflex Verification tools in `utils/reflex/`
+1. Locate Reflex Verification tools in `utils/reflex/` (in release zip from [Streamline releases](https://github.com/NVIDIA-RTX/Streamline/releases) or `Reflex_Verification/` in [Reflex Github](https://github.com/NVIDIA-RTX/REFLEX))
 2. Install FrameView SDK
     * Double click the FrameView SDK Installer (`FVSDKSetup.exe`)
     * Restart the system
@@ -379,5 +385,16 @@ GPU Start/End Time | Timestamp | Start = GPU rendering starts; End = GPU renderi
 > **NOTE:**
 > All durations and timestamps should be non-zero. Start timestamps must be less than end values (I.e., start must come before end).
 
+### 9.0 SUPPORTED CONFIGURATIONS
+
+| Scenario | VRR | FG | Reflex
+|-|-|-|-
+| GPU bound | Any | Any | Reduces latency
+| VSync On | On | Any | Reduces latency
+| VSync On | Off | On | Reduces latency
+| VSync On | Off | Off | No latency reduction
+| CPU bound | Any | Any | No latency reduction
+
 [1]: <RTX UI Developer Guidelines.pdf>
 [2]: https://developer.nvidia.com/performance-rendering-tools/reflex
+[3]: https://github.com/NVIDIA-RTX/REFLEX/blob/main/NVIDIA%20Reflex%20SDK%20Integration%20Guide.pdf
